@@ -1,0 +1,9 @@
+{
+  "reviewPromptFocus": [
+    "bugs and correctness issues",
+    "missing error handling or edge cases",
+    "security concerns",
+    "performance problems"
+  ],
+  "skipStyleFeedback": true
+}
