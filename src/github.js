@@ -1,5 +1,8 @@
 import { Octokit } from '@octokit/rest';
 import { execSync } from 'child_process';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { detectPackageManager } from './worktree.js';
 
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
@@ -30,11 +33,14 @@ async function withRetry(fn, label = 'API call') {
       }
     }
   }
+  // Unreachable today (the last attempt always throws), but guards against
+  // future changes to the retry guard silently returning undefined.
+  throw new Error(`${label} exhausted ${MAX_RETRIES} retries`);
 }
 
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
 
-function severityScore(issue) {
+export function severityScore(issue) {
   const labelNames = issue.labels.map(l =>
     typeof l === 'string' ? l : l.name
   );
@@ -45,8 +51,9 @@ function severityScore(issue) {
 }
 
 export async function fetchIssues(owner, repo) {
-  const { data: issues } = await withRetry(
-    () => octokit.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 }),
+  // paginate so repos with >100 open issues don't silently drop the overflow.
+  const issues = await withRetry(
+    () => octokit.paginate(octokit.issues.listForRepo, { owner, repo, state: 'open', per_page: 100 }),
     'fetchIssues',
   );
 
@@ -69,90 +76,160 @@ export function getSeverity(issue) {
   return 'medium';
 }
 
-export async function validateBranch(worktreeDir) {
+const CODE_FILE_RE = /\.(ts|tsx|js|jsx|cjs|mjs)$/;
+const TEST_FILE_RE = /(\.(test|spec)\.(ts|tsx|js|jsx|cjs|mjs)$|(^|\/)(__tests__|tests?)\/)/;
+
+/** True if a path looks like a test file (by suffix or test directory). */
+export function isTestFile(path) {
+  return TEST_FILE_RE.test(path);
+}
+
+/** Split changed paths into production code vs test files. */
+export function classifyChangedFiles(files) {
+  const code = [];
+  const tests = [];
+  for (const f of files) {
+    if (!CODE_FILE_RE.test(f)) continue;
+    (isTestFile(f) ? tests : code).push(f);
+  }
+  return { code, tests };
+}
+
+/** Whether the "fix must include tests" gate is enabled (default: yes). */
+export function requireTests(env = process.env) {
+  return env.REQUIRE_TESTS !== 'false';
+}
+
+/** Resolve the lint command: LINT_COMMAND overrides; else the repo's `lint` script; else none. */
+export function detectLintCommand(worktreeDir, env = process.env) {
+  if (env.LINT_COMMAND) return env.LINT_COMMAND;
   try {
-    // Collect changed files: committed changes vs origin/main + any uncommitted changes
-    const committed = execSync('git diff --name-only origin/main...HEAD', {
-      cwd: worktreeDir, encoding: 'utf-8',
-    }).trim();
-    const staged = execSync('git diff --name-only --cached', {
-      cwd: worktreeDir, encoding: 'utf-8',
-    }).trim();
-    const unstaged = execSync('git diff --name-only', {
-      cwd: worktreeDir, encoding: 'utf-8',
-    }).trim();
-
-    const allChanged = [...new Set(
-      [committed, staged, unstaged].join('\n').split('\n').filter(Boolean)
-    )];
-
-    const codeFiles = allChanged.filter(f => /\.(ts|tsx|js|jsx)$/.test(f));
-
-    if (codeFiles.length === 0) {
-      return { passed: true }; // no code changes to test
+    const pkg = JSON.parse(readFileSync(join(worktreeDir, 'package.json'), 'utf-8'));
+    if (pkg.scripts?.lint) {
+      return `${detectPackageManager(worktreeDir, env)} run lint`;
     }
+  } catch {
+    // no package.json / unreadable — no lint gate
+  }
+  return null;
+}
 
-    const quotedFiles = codeFiles.map(f => `'${f.replace(/'/g, "'\\''")}'`).join(' ');
-    const vitestCmd = `npx vitest related ${quotedFiles} --reporter=json`;
+function collectChangedFiles(worktreeDir) {
+  const ranges = [
+    'git diff --name-only origin/main...HEAD',
+    'git diff --name-only --cached',
+    'git diff --name-only',
+  ];
+  const out = ranges
+    .map(cmd => execSync(cmd, { cwd: worktreeDir, encoding: 'utf-8' }).trim())
+    .join('\n');
+  return [...new Set(out.split('\n').filter(Boolean))];
+}
 
-    // Run related tests on the fix branch
-    let fixOutput;
-    try {
-      fixOutput = execSync(vitestCmd, {
-        cwd: worktreeDir, stdio: 'pipe', timeout: 120_000,
-      }).toString();
-    } catch (err) {
-      // vitest exits non-zero when tests fail — stdout still has JSON results
-      fixOutput = err.stdout?.toString() || '';
-      if (!fixOutput) {
-        return { passed: false, error: err.stderr?.toString() || err.message };
-      }
-    }
+function runRelatedTests(worktreeDir, codeFiles) {
+  const quotedFiles = codeFiles.map(f => `'${f.replace(/'/g, "'\\''")}'`).join(' ');
+  const vitestCmd = `npx vitest related ${quotedFiles} --reporter=json`;
 
-    const fixFailures = parseFailedTests(fixOutput);
-    if (fixFailures.length === 0) {
-      return { passed: true };
-    }
-
-    // Tests failed — check which ones already fail on origin/main (pre-existing)
-    const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
-      cwd: worktreeDir, encoding: 'utf-8',
-    }).trim();
-
-    let baseFailures = [];
-    try {
-      execSync('git checkout origin/main --quiet', { cwd: worktreeDir, stdio: 'pipe' });
-      let baseOutput;
-      try {
-        baseOutput = execSync(vitestCmd, {
-          cwd: worktreeDir, stdio: 'pipe', timeout: 120_000,
-        }).toString();
-      } catch (err) {
-        baseOutput = err.stdout?.toString() || '';
-      }
-      baseFailures = parseFailedTests(baseOutput);
-    } finally {
-      execSync(`git checkout ${currentBranch} --quiet`, { cwd: worktreeDir, stdio: 'pipe' });
-    }
-
-    // Only fail on NEW test failures introduced by the fix
-    const baseFailureSet = new Set(baseFailures);
-    const newFailures = fixFailures.filter(t => !baseFailureSet.has(t));
-
-    if (newFailures.length === 0) {
-      return { passed: true }; // only pre-existing failures
-    }
-
-    return {
-      passed: false,
-      error: `New test failures: ${newFailures.join(', ')}`,
-    };
+  let fixOutput;
+  try {
+    fixOutput = execSync(vitestCmd, { cwd: worktreeDir, stdio: 'pipe', timeout: 120_000 }).toString();
   } catch (err) {
-    return { passed: false, error: err.stderr?.toString() || err.message };
+    fixOutput = err.stdout?.toString() || '';
+    if (!fixOutput) return { passed: false, error: err.stderr?.toString() || err.message };
+  }
+
+  const fixFailures = parseFailedTests(fixOutput);
+  if (fixFailures.length === 0) return { passed: true };
+
+  // Tests failed — subtract failures that already fail on origin/main (pre-existing).
+  const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: worktreeDir, encoding: 'utf-8' }).trim();
+  let baseFailures;
+  try {
+    execSync('git checkout origin/main --quiet', { cwd: worktreeDir, stdio: 'pipe' });
+    let baseOutput;
+    try {
+      baseOutput = execSync(vitestCmd, { cwd: worktreeDir, stdio: 'pipe', timeout: 120_000 }).toString();
+    } catch (err) {
+      baseOutput = err.stdout?.toString() || '';
+    }
+    baseFailures = parseFailedTests(baseOutput);
+  } finally {
+    execSync(`git checkout ${currentBranch} --quiet`, { cwd: worktreeDir, stdio: 'pipe' });
+  }
+
+  const baseFailureSet = new Set(baseFailures);
+  const newFailures = fixFailures.filter(t => !baseFailureSet.has(t));
+  if (newFailures.length === 0) return { passed: true };
+  return { passed: false, error: `New test failures: ${newFailures.join(', ')}` };
+}
+
+function lintOnce(cmd, worktreeDir) {
+  try {
+    execSync(cmd, { cwd: worktreeDir, stdio: 'pipe', timeout: 120_000 });
+    return { ok: true, out: '' };
+  } catch (err) {
+    return { ok: false, out: (err.stdout?.toString() || '') + (err.stderr?.toString() || '') };
   }
 }
 
-function parseFailedTests(jsonOutput) {
+function runLintGate(worktreeDir, env) {
+  const cmd = detectLintCommand(worktreeDir, env);
+  if (!cmd) return { passed: true }; // no linter configured — nothing to gate on
+
+  const branch = lintOnce(cmd, worktreeDir);
+  if (branch.ok) return { passed: true };
+
+  // Lint failed on the branch — only block if it was clean on origin/main, so
+  // we don't fail the fix on pre-existing lint debt.
+  const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: worktreeDir, encoding: 'utf-8' }).trim();
+  let baseOk;
+  try {
+    execSync('git checkout origin/main --quiet', { cwd: worktreeDir, stdio: 'pipe' });
+    baseOk = lintOnce(cmd, worktreeDir).ok;
+  } finally {
+    execSync(`git checkout ${currentBranch} --quiet`, { cwd: worktreeDir, stdio: 'pipe' });
+  }
+  if (!baseOk) return { passed: true }; // pre-existing lint failures — don't block
+  return { passed: false, error: `New lint errors:\n${branch.out.slice(0, 2000)}` };
+}
+
+/**
+ * Validate a fix branch through ordered gates. Returns the failing `stage` so
+ * the caller can report a precise status:
+ *   tests-missing → code changed but no test added/modified
+ *   tests         → new test failures introduced by the fix
+ *   lint          → new lint errors introduced by the fix
+ */
+export async function validateBranch(worktreeDir, env = process.env) {
+  try {
+    const { code, tests } = classifyChangedFiles(collectChangedFiles(worktreeDir));
+
+    if (code.length === 0) return { passed: true }; // no production code changed
+
+    // Gate: a fix that changes code must add or modify tests.
+    if (requireTests(env) && tests.length === 0) {
+      return {
+        passed: false,
+        stage: 'tests-missing',
+        error: `Fix changed code (${code.join(', ')}) but added/modified no tests. Set REQUIRE_TESTS=false to disable this gate.`,
+      };
+    }
+
+    // Gate: related tests must pass (no new failures).
+    const testResult = runRelatedTests(worktreeDir, code);
+    if (!testResult.passed) return { passed: false, stage: 'tests', error: testResult.error };
+
+    // Gate: linter must pass (no new errors).
+    const lintResult = runLintGate(worktreeDir, env);
+    if (!lintResult.passed) return { passed: false, stage: 'lint', error: lintResult.error };
+
+    return { passed: true };
+  } catch (err) {
+    return { passed: false, stage: 'error', error: err.stderr?.toString() || err.message };
+  }
+}
+
+export function parseFailedTests(jsonOutput) {
   try {
     const result = JSON.parse(jsonOutput);
     const failures = [];
@@ -211,5 +288,69 @@ export async function mergePr(owner, repo, prNumber) {
     () => octokit.pulls.merge({ owner, repo, pull_number: prNumber, merge_method: 'squash' }),
     `mergePr(#${prNumber})`,
   );
+}
+
+/**
+ * Delete a remote branch after its PR is merged so fix/issue-N branches don't
+ * accumulate on the remote (CRITIQUE #6). Best-effort: a missing ref (e.g.
+ * GitHub's auto-delete-head already removed it) is not an error.
+ */
+export async function deleteRemoteBranch(owner, repo, branch) {
+  try {
+    await withRetry(
+      () => octokit.git.deleteRef({ owner, repo, ref: `heads/${branch}` }),
+      `deleteRemoteBranch(${branch})`,
+    );
+  } catch (err) {
+    if (err.status === 422 || err.status === 404) return; // already deleted
+    throw err;
+  }
+}
+
+/**
+ * Summarize GitHub check-runs for a commit into a terminal decision.
+ * Pure: takes the check-run array, returns counts + an overall state of
+ * 'pending' | 'passed' | 'failed'. A run is failing if it completed with a
+ * non-success/neutral/skipped conclusion.
+ */
+export function summarizeChecks(checkRuns = []) {
+  const passingConclusions = new Set(['success', 'neutral', 'skipped']);
+  let pending = 0, failed = 0, passed = 0;
+  for (const run of checkRuns) {
+    if (run.status !== 'completed') { pending++; continue; }
+    if (passingConclusions.has(run.conclusion)) passed++;
+    else failed++;
+  }
+  let state = 'passed';
+  if (failed > 0) state = 'failed';
+  else if (pending > 0) state = 'pending';
+  return { total: checkRuns.length, pending, failed, passed, state };
+}
+
+/**
+ * Wait for the PR head SHA's CI checks to finish. Opt-in (WAIT_FOR_CI=true).
+ * Returns { passed, error }. Polls until all checks complete or the timeout is
+ * hit; a timeout with checks still pending is treated as not-passed.
+ * (No offline test seam — exercises the live GitHub checks API.)
+ */
+export async function waitForChecks(owner, repo, ref, {
+  timeoutMs = Number(process.env.CI_TIMEOUT_MS) || 600_000,
+  intervalMs = Number(process.env.CI_POLL_INTERVAL_MS) || 15_000,
+  now = Date.now,
+  sleep = ms => new Promise(r => setTimeout(r, ms)),
+} = {}) {
+  const deadline = now() + timeoutMs;
+  while (true) {
+    const { data } = await withRetry(
+      () => octokit.checks.listForRef({ owner, repo, ref, per_page: 100 }),
+      `waitForChecks(${ref})`,
+    );
+    const summary = summarizeChecks(data.check_runs);
+    if (summary.total === 0) return { passed: true }; // no CI configured
+    if (summary.state === 'failed') return { passed: false, error: `${summary.failed} CI check(s) failed` };
+    if (summary.state === 'passed') return { passed: true };
+    if (now() >= deadline) return { passed: false, error: `CI still pending after ${Math.round(timeoutMs / 1000)}s (${summary.pending} unfinished)` };
+    await sleep(intervalMs);
+  }
 }
 

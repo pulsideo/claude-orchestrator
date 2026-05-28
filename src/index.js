@@ -65,8 +65,12 @@ async function main() {
   const merged = results.filter(r => r.status === 'merged').length;
   const success = results.filter(r => r.status === 'success').length;
   const needsReview = results.filter(r => r.status === 'needs-human-review').length;
+  const noPr = results.filter(r => r.status === 'no-pr').length;
   const fixTestsFailed = results.filter(r => r.status === 'fix-tests-failed').length;
-  const knownStatuses = ['merged', 'success', 'needs-human-review', 'fix-tests-failed', 'dry-run'];
+  const testsMissing = results.filter(r => r.status === 'tests-missing').length;
+  const lintFailed = results.filter(r => r.status === 'lint-failed').length;
+  const ciFailed = results.filter(r => r.status === 'ci-failed').length;
+  const knownStatuses = ['merged', 'success', 'no-pr', 'needs-human-review', 'fix-tests-failed', 'tests-missing', 'lint-failed', 'ci-failed', 'dry-run'];
   const errored = results.filter(r => !knownStatuses.includes(r.status)).length;
   const dryRunCount = results.filter(r => r.status === 'dry-run').length;
 
@@ -74,9 +78,21 @@ async function main() {
     console.log(`Dry run: ${dryRunCount} issues would be processed`);
   } else {
     console.log(`Merged: ${merged}`);
-    console.log(`Success (pending merge): ${success}`);
+    console.log(`Success (PR open, pending human review): ${success}`);
     if (needsReview > 0) {
       console.log(`Needs human review (refinement reverted): ${needsReview}`);
+    }
+    if (noPr > 0) {
+      console.log(`No PR opened (fix pushed but no PR found): ${noPr}`);
+    }
+    if (testsMissing > 0) {
+      console.log(`Fix added no tests (rejected): ${testsMissing}`);
+    }
+    if (lintFailed > 0) {
+      console.log(`Lint failed: ${lintFailed}`);
+    }
+    if (ciFailed > 0) {
+      console.log(`CI failed: ${ciFailed}`);
     }
     console.log(`Fix tests failed: ${fixTestsFailed}`);
     console.log(`Errored: ${errored}`);

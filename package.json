@@ -2,12 +2,23 @@
   "name": "claude-issue-orchestrator",
   "version": "1.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node src/index.js",
-    "dry-run": "DRY_RUN=true node src/index.js"
+    "dry-run": "DRY_RUN=true node src/index.js",
+    "lint": "eslint src test eslint.config.js",
+    "lint:fix": "eslint src test eslint.config.js --fix",
+    "test": "node --test"
   },
   "dependencies": {
     "@octokit/rest": "^21.0.0",
     "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.4.0",
+    "globals": "^17.6.0"
   }
 }

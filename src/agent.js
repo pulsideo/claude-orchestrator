@@ -68,22 +68,28 @@ function runClaude({ prompt, model, allowedTools, cwd, timeout }) {
         return;
       }
 
-      try {
-        const result = JSON.parse(stdout);
-        resolve({
-          output: result.result || stdout,
-          cost: result.cost_usd || 0,
-          duration,
-        });
-      } catch {
-        resolve({
-          output: stdout,
-          cost: 0,
-          duration,
-        });
-      }
+      const parsed = parseClaudeResult(stdout);
+      resolve({ ...parsed, duration });
     });
   });
+}
+
+/**
+ * Parse the JSON emitted by `claude --output-format json`.
+ * The CLI field is `total_cost_usd` (verified against CLI 2.1.x); older
+ * versions used `cost_usd`, kept as a fallback. Falls back to raw stdout when
+ * the payload isn't valid JSON.
+ */
+export function parseClaudeResult(stdout) {
+  try {
+    const result = JSON.parse(stdout);
+    return {
+      output: result.result || stdout,
+      cost: result.total_cost_usd ?? result.cost_usd ?? 0,
+    };
+  } catch {
+    return { output: stdout, cost: 0 };
+  }
 }
 
 export function runTriageAgent(issue, worktreeDir) {
