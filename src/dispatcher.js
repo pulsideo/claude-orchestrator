@@ -1,7 +1,7 @@
 import { execSync } from 'child_process';
-import { validateBranch, getSeverity, getPrForBranch, mergePr, flagForHumanReview, deleteRemoteBranch, waitForChecks } from './github.js';
+import { validateBranch, getSeverity, getPrForBranch, createPr, mergePr, flagForHumanReview, deleteRemoteBranch, waitForChecks } from './github.js';
 import { createWorktree, removeWorktree } from './worktree.js';
-import { runTriageAgent, runFixAgent, runRefinementAgent, runReviewAgent } from './agent.js';
+import { runTriageAgent, runFixAgent, runReworkAgent, runReviewAgent } from './agent.js';
 import { reviewWithGreptile, getDiff } from './greptile.js';
 import { logResult, getRunCost, startRun } from './logger.js';
 
@@ -26,17 +26,109 @@ export function statusForStage(stage) {
 }
 
 /**
+ * Decide the next action in the fix→review loop from the current iteration's
+ * facts (ADR 0002). 'confirmed' = gates passed and no blocking findings.
+ */
+export function loopDecision({ validationPassed, blocking, iteration, maxIterations }) {
+  if (!validationPassed) {
+    return iteration < maxIterations ? 'rework-validation' : 'fail-validation';
+  }
+  if (!blocking) return 'confirmed';
+  return iteration < maxIterations ? 'rework-review' : 'unconfirmed-blocking';
+}
+
+/**
  * Decide the terminal status for a processed issue from observed facts.
  * A fix that passes tests but has NO pull request is reported as 'no-pr',
  * never 'success' (CRITIQUE #2) — so the run summary can't claim a fix landed
  * when nothing was opened.
  */
-export function resolveStatus({ merged, refinementReverted, ciFailed, prExists }) {
+export function resolveStatus({ merged, needsHumanReview, ciFailed, prExists }) {
   if (merged) return 'merged';
-  if (refinementReverted) return 'needs-human-review';
+  if (needsHumanReview) return 'needs-human-review';
   if (ciFailed) return 'ci-failed';
   if (!prExists) return 'no-pr';
   return 'success';
+}
+
+/** Acquire a review for the current branch: Greptile if configured, else the reviewer provider. */
+async function acquireReview(issue, worktreeDir) {
+  try {
+    if (process.env.GREPTILE_API_KEY) {
+      const comments = await reviewWithGreptile(worktreeDir);
+      return { blocking: comments.length > 0, comments, cost: 0 };
+    }
+    if (process.env.ENABLE_REVIEW === 'false') {
+      return { blocking: false, comments: [], cost: 0 };
+    }
+    const review = await runReviewAgent(issue, getDiff(worktreeDir), worktreeDir);
+    console.log(`[REVIEW] ${review.provider}/${review.model}: ${review.blocking ? 'changes requested' : 'no blocking findings'} ($${review.cost.toFixed(4)})`);
+    return { blocking: review.blocking, comments: review.comments, cost: review.cost };
+  } catch (err) {
+    console.warn(`[REVIEW] Review failed: ${err.error || err.message}. Treating as no blocking findings.`);
+    return { blocking: false, comments: [], cost: 0 };
+  }
+}
+
+function formatReviewComments(comments) {
+  return comments.map(c => (
+    c.type === 'inline'
+      ? `- \`${c.path}\`${c.line ? ` line ${c.line}` : ''}: ${c.body}`
+      : `- ${c.body}`
+  )).join('\n');
+}
+
+function pushBranch(worktree) {
+  try {
+    execSync(`git push origin ${worktree.branch} --force-with-lease`, { cwd: worktree.dir, stdio: 'pipe' });
+  } catch (err) {
+    console.warn(`[PUSH] ${worktree.branch}: ${err.message}`);
+  }
+}
+
+/** Squash-merge the branch's PR, rebasing+revalidating on conflict. Returns whether it merged. */
+async function attemptMerge(worktree) {
+  const MAX_MERGE_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_MERGE_RETRIES; attempt++) {
+    try {
+      const pr = await getPrForBranch(GITHUB_OWNER, GITHUB_REPO, worktree.branch);
+      if (!pr) return false;
+      console.log(`[MERGE] Merging PR #${pr.number} into main...`);
+      await mergePr(GITHUB_OWNER, GITHUB_REPO, pr.number);
+      console.log(`[MERGE] PR #${pr.number} merged successfully.`);
+      try {
+        await deleteRemoteBranch(GITHUB_OWNER, GITHUB_REPO, worktree.branch);
+        console.log(`[MERGE] Deleted remote branch ${worktree.branch}.`);
+      } catch (err) {
+        console.warn(`[MERGE] Could not delete remote branch ${worktree.branch}: ${err.message}`);
+      }
+      return true;
+    } catch (err) {
+      const isStaleBase = err.message?.includes('Base branch was modified');
+      const isNotMergeable = err.message?.includes('not mergeable') || err.message?.includes('Pull Request is not mergeable');
+      if ((isStaleBase || isNotMergeable) && attempt < MAX_MERGE_RETRIES) {
+        console.log(`[MERGE] ${isStaleBase ? 'Base branch changed' : 'PR not mergeable (likely conflict)'}. Rebasing and retrying (${attempt}/${MAX_MERGE_RETRIES})...`);
+        try {
+          execSync('git fetch origin main', { cwd: worktree.dir, stdio: 'pipe' });
+          execSync('git rebase origin/main', { cwd: worktree.dir, stdio: 'pipe' });
+          execSync(`git push origin ${worktree.branch} --force-with-lease`, { cwd: worktree.dir, stdio: 'pipe' });
+          const postRebase = await validateBranch(worktree.dir);
+          if (!postRebase.passed) {
+            console.warn(`[MERGE] Validation failed after rebase: ${postRebase.error}`);
+            return false;
+          }
+        } catch (rebaseErr) {
+          console.warn(`[MERGE] Rebase failed: ${rebaseErr.message}. Aborting merge.`);
+          try { execSync('git rebase --abort', { cwd: worktree.dir, stdio: 'pipe' }); } catch { /* nothing to abort */ }
+          return false;
+        }
+      } else {
+        console.warn(`[MERGE] Failed to merge: ${err.message}`);
+        return false;
+      }
+    }
+  }
+  return false;
 }
 
 export async function processIssue(issue, repoPath, dryRun = false) {
@@ -92,79 +184,96 @@ export async function processIssue(issue, repoPath, dryRun = false) {
       return { issue: issue.number, status: 'fix-failed', totalCost };
     }
 
-    // Phase 4: Validate (tests-present → tests-pass → lint gates)
-    console.log(`[VALIDATE] Running validation gates...`);
-    const validation = await validateBranch(worktree.dir);
-    if (!validation.passed) {
-      const failStatus = statusForStage(validation.stage);
-      console.log(`[VALIDATE] ${failStatus} (stage: ${validation.stage})`);
-      console.log(`[VALIDATE] Error: ${validation.error}`);
-      const cost = (triageResult?.cost || 0) + (fixResult?.cost || 0);
+    // Phase 3.5: orchestrator owns PR creation (ADR 0003). Ensure the branch is
+    // pushed and a PR exists before the review loop / human handoff.
+    if (GITHUB_OWNER && GITHUB_REPO) {
+      try {
+        execSync(`git push origin ${worktree.branch}`, { cwd: worktree.dir, stdio: 'pipe' });
+      } catch (err) {
+        console.warn(`[PR] Push failed for ${worktree.branch}: ${err.message}`);
+      }
+      try {
+        const pr = await createPr(
+          GITHUB_OWNER, GITHUB_REPO, worktree.branch,
+          `fix: resolve issue #${issue.number} - ${issue.title}`,
+          `Closes #${issue.number}`,
+        );
+        console.log(`[PR] PR #${pr.number} ready: ${pr.html_url}`);
+      } catch (err) {
+        console.warn(`[PR] Could not create PR for ${worktree.branch}: ${err.message}`);
+      }
+    }
+
+    // Phases 4–5: iterative fix → validate → review loop (ADR 0002).
+    const MAX_ITER = Math.max(1, parseInt(process.env.MAX_ITERATIONS || '3', 10) || 3);
+    let confirmed = false;
+    let blockingAtCap = false;
+    let failStage = null;
+    let reviewCost = 0;
+    let reworkCost = 0;
+    let reworkDuration = 0;
+
+    for (let iteration = 1; iteration <= MAX_ITER; iteration++) {
+      console.log(`[LOOP] Iteration ${iteration}/${MAX_ITER}`);
+      const validation = await validateBranch(worktree.dir);
+
+      if (!validation.passed) {
+        console.log(`[VALIDATE] failed at '${validation.stage}' gate: ${validation.error}`);
+        if (loopDecision({ validationPassed: false, blocking: false, iteration, maxIterations: MAX_ITER }) === 'fail-validation') {
+          failStage = validation.stage;
+          break;
+        }
+        try {
+          const r = await runReworkAgent(issue, `The fix did not pass the '${validation.stage}' gate:\n${validation.error}\n\nResolve this so the gate passes; keep the change minimal.`, worktree.dir);
+          reworkCost += r.cost;
+          reworkDuration += r.duration;
+          pushBranch(worktree);
+        } catch (err) {
+          console.warn(`[REWORK] failed: ${err.error || err.message}`);
+          failStage = validation.stage;
+          break;
+        }
+        continue;
+      }
+      console.log(`[VALIDATE] gates passed`);
+
+      const review = await acquireReview(issue, worktree.dir);
+      reviewCost += review.cost;
+      const decision = loopDecision({ validationPassed: true, blocking: review.blocking, iteration, maxIterations: MAX_ITER });
+      if (decision === 'confirmed') { confirmed = true; break; }
+      if (decision === 'unconfirmed-blocking') { blockingAtCap = true; break; }
+
+      console.log(`[REWORK] Addressing ${review.comments.length} review finding(s)...`);
+      try {
+        const r = await runReworkAgent(issue, formatReviewComments(review.comments), worktree.dir);
+        reworkCost += r.cost;
+        reworkDuration += r.duration;
+        pushBranch(worktree);
+      } catch (err) {
+        console.warn(`[REWORK] failed: ${err.error || err.message}`);
+        blockingAtCap = true;
+        break;
+      }
+    }
+
+    // Validation never passed within the cap → terminal validation status.
+    if (failStage) {
+      const failStatus = statusForStage(failStage);
+      const cost = (triageResult?.cost || 0) + (fixResult?.cost || 0) + reviewCost + reworkCost;
       const totalCost = logResult(issue.number, {
         model: fixResult.model,
         cost,
         status: failStatus,
-        duration: (triageResult?.duration || 0) + fixResult.duration,
+        duration: (triageResult?.duration || 0) + fixResult.duration + reworkDuration,
         output: fixResult.output,
       });
       return { issue: issue.number, status: failStatus, cost, totalCost };
     }
-    console.log(`[VALIDATE] passed`);
 
-    // Phase 5: code review (Greptile if configured, else the reviewer provider) + refine
-    let refineCost = 0;
-    let refineDuration = 0;
-    let reviewCost = 0;
-    let refinementReverted = false;
-    let comments = [];
-    try {
-      if (process.env.GREPTILE_API_KEY) {
-        console.log(`[REVIEW] Requesting Greptile code review...`);
-        comments = await reviewWithGreptile(worktree.dir);
-      } else if (process.env.ENABLE_REVIEW !== 'false') {
-        const reviewProvider = process.env.REVIEW_PROVIDER || process.env.DEFAULT_PROVIDER || 'claude';
-        console.log(`[REVIEW] Reviewing with provider '${reviewProvider}'...`);
-        const review = await runReviewAgent(issue, getDiff(worktree.dir), worktree.dir);
-        comments = review.comments;
-        reviewCost = review.cost;
-        console.log(`[REVIEW] Done (${(review.duration / 1000).toFixed(1)}s, $${review.cost.toFixed(4)}, ${review.provider}/${review.model})`);
-      }
-    } catch (err) {
-      console.warn(`[REVIEW] Review failed: ${err.error || err.message}. Proceeding without review.`);
-      comments = [];
-    }
-
-    if (comments.length > 0) {
-      console.log(`[REVIEW] Got ${comments.length} review comment(s). Running refinement agent...`);
-      try {
-        const refineResult = await runRefinementAgent(issue, comments, worktree.dir);
-        refineCost = refineResult.cost;
-        refineDuration = refineResult.duration;
-        console.log(`[REFINE] Done (${(refineDuration / 1000).toFixed(1)}s, $${refineCost})`);
-
-        // Re-validate after refinement
-        console.log(`[VALIDATE] Re-running validation after refinement...`);
-        const revalidation = await validateBranch(worktree.dir);
-        if (!revalidation.passed) {
-          console.log(`[VALIDATE] Refinement broke validation: ${revalidation.error}`);
-          console.log(`[REFINE] Reverting refinement commit...`);
-          execSync('git reset --hard HEAD~1', { cwd: worktree.dir, stdio: 'pipe' });
-          execSync(`git push origin ${worktree.branch} --force-with-lease`, { cwd: worktree.dir, stdio: 'pipe' });
-          refinementReverted = true;
-        } else {
-          console.log(`[VALIDATE] Still passing after refinement`);
-        }
-      } catch (err) {
-        console.warn(`[REFINE] Refinement failed: ${err.error || err.message}. Continuing with original fix.`);
-      }
-    } else {
-      console.log(`[REVIEW] No review comments. Proceeding with original fix.`);
-    }
-
-    // Phase 5.5: optional CI gate — wait for the PR's GitHub checks to go green
-    // before treating the fix as confirmed (opt-in via WAIT_FOR_CI).
+    // Phase 5.5: optional CI gate — only meaningful once the fix is locally
+    // confirmed (gates passed + no blocking findings). Opt-in via WAIT_FOR_CI.
     let ciFailed = false;
-    if (process.env.WAIT_FOR_CI === 'true' && !refinementReverted && GITHUB_OWNER && GITHUB_REPO) {
+    if (confirmed && process.env.WAIT_FOR_CI === 'true' && GITHUB_OWNER && GITHUB_REPO) {
       try {
         const pr = await getPrForBranch(GITHUB_OWNER, GITHUB_REPO, worktree.branch);
         if (pr) {
@@ -182,64 +291,21 @@ export async function processIssue(issue, repoPath, dryRun = false) {
       }
     }
 
-    // Phase 6: Auto-merge only when confirmed (tests+lint passed, refinement not
-    // reverted, CI green), otherwise flag for human review.
+    // Phase 6: auto-merge only when confirmed + CI ok + opted in; otherwise leave
+    // the PR open, flagging for human review when the fix isn't confirmed.
     let merged = false;
-    if (AUTO_MERGE === 'true' && !refinementReverted && !ciFailed && GITHUB_OWNER && GITHUB_REPO) {
-      const MAX_MERGE_RETRIES = 3;
-      for (let attempt = 1; attempt <= MAX_MERGE_RETRIES; attempt++) {
-        try {
-          const pr = await getPrForBranch(GITHUB_OWNER, GITHUB_REPO, worktree.branch);
-          if (!pr) break;
-          console.log(`[MERGE] Tests passing after review cycle. Merging PR #${pr.number} into main...`);
-          await mergePr(GITHUB_OWNER, GITHUB_REPO, pr.number);
-          console.log(`[MERGE] PR #${pr.number} merged successfully.`);
-          merged = true;
-          // Clean up the remote branch so fix/issue-N branches don't pile up.
-          try {
-            await deleteRemoteBranch(GITHUB_OWNER, GITHUB_REPO, worktree.branch);
-            console.log(`[MERGE] Deleted remote branch ${worktree.branch}.`);
-          } catch (err) {
-            console.warn(`[MERGE] Could not delete remote branch ${worktree.branch}: ${err.message}`);
-          }
-          break;
-        } catch (err) {
-          const isStaleBase = err.message?.includes('Base branch was modified');
-          const isNotMergeable = err.message?.includes('not mergeable') || err.message?.includes('Pull Request is not mergeable');
-          if ((isStaleBase || isNotMergeable) && attempt < MAX_MERGE_RETRIES) {
-            console.log(`[MERGE] ${isStaleBase ? 'Base branch changed' : 'PR not mergeable (likely conflict)'}. Rebasing and retrying (attempt ${attempt}/${MAX_MERGE_RETRIES})...`);
-            try {
-              execSync('git fetch origin main', { cwd: worktree.dir, stdio: 'pipe' });
-              execSync('git rebase origin/main', { cwd: worktree.dir, stdio: 'pipe' });
-              execSync(`git push origin ${worktree.branch} --force-with-lease`, { cwd: worktree.dir, stdio: 'pipe' });
-              // Re-validate after rebase
-              console.log(`[MERGE] Re-running tests after rebase...`);
-              const postRebase = await validateBranch(worktree.dir);
-              if (!postRebase.passed) {
-                console.warn(`[MERGE] Tests failed after rebase: ${postRebase.error}`);
-                break;
-              }
-            } catch (rebaseErr) {
-              console.warn(`[MERGE] Rebase failed: ${rebaseErr.message}. Aborting merge.`);
-              try { execSync('git rebase --abort', { cwd: worktree.dir, stdio: 'pipe' }); } catch {}
-              break;
-            }
-          } else {
-            console.warn(`[MERGE] Failed to merge: ${err.message}`);
-            break;
-          }
-        }
-      }
-    } else if ((refinementReverted || ciFailed) && GITHUB_OWNER && GITHUB_REPO) {
+    if (confirmed && !ciFailed && AUTO_MERGE === 'true' && GITHUB_OWNER && GITHUB_REPO) {
+      merged = await attemptMerge(worktree);
+    } else if ((blockingAtCap || ciFailed) && GITHUB_OWNER && GITHUB_REPO) {
       try {
         const pr = await getPrForBranch(GITHUB_OWNER, GITHUB_REPO, worktree.branch);
         if (pr) {
-          const reason = refinementReverted ? 'Refinement was reverted' : 'CI checks did not pass';
-          console.log(`[MERGE] ${reason}. Flagging PR #${pr.number} for human review.`);
+          const reason = ciFailed ? 'CI checks did not pass' : `blocking review findings remain after ${MAX_ITER} iterations`;
+          console.log(`[HANDOFF] ${reason}. Flagging PR #${pr.number} for human review.`);
           await flagForHumanReview(GITHUB_OWNER, GITHUB_REPO, pr.number);
         }
       } catch (err) {
-        console.warn(`[MERGE] Failed to flag PR for review: ${err.message}`);
+        console.warn(`[HANDOFF] Failed to flag PR for review: ${err.message}`);
       }
     }
 
@@ -255,16 +321,16 @@ export async function processIssue(issue, repoPath, dryRun = false) {
       }
     }
 
-    const status = resolveStatus({ merged, refinementReverted, ciFailed, prExists });
+    const status = resolveStatus({ merged, needsHumanReview: blockingAtCap, ciFailed, prExists });
     if (status === 'no-pr') {
       console.warn(`[PR] No pull request found for ${worktree.branch}. Fix is committed/pushed but no PR was opened — flagging as no-pr.`);
     }
-    const cost = (triageResult?.cost || 0) + (fixResult?.cost || 0) + reviewCost + refineCost;
+    const cost = (triageResult?.cost || 0) + (fixResult?.cost || 0) + reviewCost + reworkCost;
     const totalCost = logResult(issue.number, {
       model: fixResult.model,
       cost,
       status,
-      duration: (triageResult?.duration || 0) + fixResult.duration + refineDuration,
+      duration: (triageResult?.duration || 0) + fixResult.duration + reworkDuration,
       output: fixResult.output,
     });
 

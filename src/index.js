@@ -2,34 +2,56 @@ import 'dotenv/config';
 import { fetchIssues } from './github.js';
 import { runQueue } from './dispatcher.js';
 import { cleanupAllWorktrees } from './worktree.js';
+import { runDiscovery } from './discovery.js';
+import { shouldShowMenu, runMenu } from './menu.js';
 
 const {
   GITHUB_TOKEN,
   GITHUB_OWNER,
   GITHUB_REPO,
   REPO_LOCAL_PATH,
-  MAX_CONCURRENCY = '3',
-  COST_CEILING_USD = '50',
   DRY_RUN,
 } = process.env;
 
 async function main() {
   console.log(`\nClaude Issue Orchestrator`);
   console.log(`========================`);
-  console.log(`Repo: ${GITHUB_OWNER}/${GITHUB_REPO}`);
-  console.log(`Concurrency: ${MAX_CONCURRENCY}`);
-  console.log(`Cost ceiling: $${COST_CEILING_USD}`);
-  console.log(`Dry run: ${!!DRY_RUN}\n`);
 
-  // Validate required env vars
+  // Validate required env vars before anything else.
   if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO || !REPO_LOCAL_PATH) {
     console.error('Missing required environment variables. Copy .env.example to .env and fill in your values.');
     process.exit(1);
   }
 
+  // Interactive settings menu (auto-skipped when headless or --no-menu).
+  if (shouldShowMenu({ argv: process.argv.slice(2), env: process.env, isTTY: !!(process.stdin.isTTY && process.stdout.isTTY) })) {
+    await runMenu(process.env);
+  }
+
+  // Read effective settings AFTER the menu may have changed them.
+  const concurrency = parseInt(process.env.MAX_CONCURRENCY || '3', 10);
+  const costCeiling = parseFloat(process.env.COST_CEILING_USD || '50');
+
+  console.log(`\nRepo: ${GITHUB_OWNER}/${GITHUB_REPO}`);
+  console.log(`Providers: default=${process.env.DEFAULT_PROVIDER || 'claude'}, fix=${process.env.FIX_PROVIDER || process.env.DEFAULT_PROVIDER || 'claude'}, review=${process.env.REVIEW_PROVIDER || process.env.DEFAULT_PROVIDER || 'claude'}`);
+  console.log(`Concurrency: ${concurrency} | Cost ceiling: $${costCeiling} | Max iterations: ${process.env.MAX_ITERATIONS || '3'} | Auto-merge: ${process.env.AUTO_MERGE || 'false'}`);
+  console.log(`Discovery: ${process.env.DISCOVERY === 'true' ? `on (${process.env.DISCOVERY_SCOPE || 'whole repo'})` : 'off'}`);
+  console.log(`Dry run: ${!!DRY_RUN}\n`);
+
   // Clean up any leftover worktrees from previous runs
   console.log(`[INIT] Cleaning stale worktrees...`);
   cleanupAllWorktrees(REPO_LOCAL_PATH);
+
+  // Optional discovery phase: scan the target repo and file new issues, which
+  // the queue below then processes in the same run (ADR 0001).
+  if (process.env.DISCOVERY === 'true' && !DRY_RUN) {
+    try {
+      const { filed } = await runDiscovery(GITHUB_OWNER, GITHUB_REPO, REPO_LOCAL_PATH);
+      console.log(`[DISCOVERY] Filed ${filed.length} new issue(s).`);
+    } catch (err) {
+      console.warn(`[DISCOVERY] Discovery failed: ${err.error || err.message}. Continuing with existing issues.`);
+    }
+  }
 
   const issues = await fetchIssues(GITHUB_OWNER, GITHUB_REPO);
   console.log(`Found ${issues.length} issues to process:\n`);
@@ -49,8 +71,8 @@ async function main() {
   const results = await runQueue(
     issues,
     REPO_LOCAL_PATH,
-    parseInt(MAX_CONCURRENCY),
-    parseFloat(COST_CEILING_USD),
+    concurrency,
+    costCeiling,
     !!DRY_RUN,
   );
 

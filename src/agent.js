@@ -57,6 +57,31 @@ export function runAgent({ role, severity, prompt, allowedTools = 'Bash,Read', c
   });
 }
 
+/**
+ * Scan the target repo for bugs within a free-text scope. Read-only; returns
+ * the agent's raw output (a JSON array of proposed bugs) for the caller to parse.
+ */
+export function runDiscoveryAgent(scope, repoPath) {
+  const prompt = loadPrompt('discover', { scope: scope || 'the whole codebase' });
+
+  return runAgent({
+    role: 'discovery',
+    severity: 'medium',
+    prompt,
+    allowedTools: 'Bash,Read',
+    cwd: repoPath,
+    timeout: 600_000,
+  }).then(result => ({
+    output: result.output,
+    cost: result.cost,
+    duration: result.duration,
+    provider: result.provider,
+    model: result.model,
+  })).catch(err => {
+    throw { phase: 'discovery', error: err.error, duration: err.duration };
+  });
+}
+
 export function runTriageAgent(issue, worktreeDir) {
   const prompt = loadPrompt('triage', {
     issueNumber: issue.number,
@@ -83,29 +108,39 @@ export function runTriageAgent(issue, worktreeDir) {
   });
 }
 
-export function runRefinementAgent(issue, reviewComments, worktreeDir) {
-  const formattedComments = reviewComments.map(c => {
-    if (c.type === 'inline') {
-      return `### Inline comment: \`${c.path}\` line ${c.line}\n${c.body}`;
-    }
-    return `### Summary comment\n${c.body}`;
-  }).join('\n\n---\n\n');
+/**
+ * Decide whether a review's output contains blocking findings. Prefers an
+ * explicit machine-readable `VERDICT:` line; falls back to detecting a
+ * BLOCKING marker (ignoring "non-blocking"). Defaults to non-blocking so the
+ * loop terminates when the reviewer is silent.
+ */
+export function parseReviewVerdict(output) {
+  const text = output || '';
+  if (/VERDICT:\s*(CHANGES|BLOCK)/i.test(text)) return true;
+  if (/VERDICT:\s*(PASS|APPROVE|LGTM)/i.test(text)) return false;
+  return /\bBLOCKING\b/i.test(text.replace(/non-blocking/gi, ''));
+}
 
-  const prompt = loadPrompt('refine', {
+/**
+ * Rework the fix to address feedback — either a failing validation gate or
+ * blocking review findings. Runs on the fix provider/tier (one loop iteration).
+ */
+export function runReworkAgent(issue, feedback, worktreeDir) {
+  const prompt = loadPrompt('rework', {
     issueNumber: issue.number,
     issueTitle: issue.title,
     issueBody: issue.body || '(no description)',
-    reviewComments: formattedComments,
+    feedback,
     branchName: `fix/issue-${issue.number}`,
   });
 
   return runAgent({
-    role: 'refine',
+    role: 'fix',
     severity: getSeverity(issue),
     prompt,
     allowedTools: 'Bash,Read,Write,Edit',
     cwd: worktreeDir,
-    timeout: 300_000,
+    timeout: 600_000,
   }).then(result => ({
     issueNumber: issue.number,
     output: result.output,
@@ -114,7 +149,7 @@ export function runRefinementAgent(issue, reviewComments, worktreeDir) {
     provider: result.provider,
     model: result.model,
   })).catch(err => {
-    throw { issueNumber: issue.number, phase: 'refine', error: err.error, duration: err.duration };
+    throw { issueNumber: issue.number, phase: 'rework', error: err.error, duration: err.duration };
   });
 }
 
@@ -171,6 +206,7 @@ export function runReviewAgent(issue, diff, worktreeDir) {
     timeout: 300_000,
   }).then(result => ({
     issueNumber: issue.number,
+    blocking: parseReviewVerdict(result.output),
     comments: result.output?.trim() ? [{ type: 'summary', body: result.output }] : [],
     cost: result.cost,
     duration: result.duration,

@@ -16,6 +16,7 @@ You are a bug-fix agent.
 4. Run tests (`npx vitest run`) to verify nothing is broken
 5. Stage and commit with message: "fix: resolve issue #{{issueNumber}} - {{issueTitle}}"
 6. Push the branch: `git push origin {{branchName}}`
-7. Create a pull request: gh pr create --title "fix: resolve issue #{{issueNumber}} - {{issueTitle}}" --body "Closes #{{issueNumber}}" --base main --head {{branchName}}
+
+The orchestrator opens the pull request for you after this step — do NOT run `gh pr create`.
 
 Keep changes minimal and focused. Do not refactor unrelated code.

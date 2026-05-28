@@ -21,7 +21,8 @@ Follow these steps in order:
 7. If any tests fail after your fix, investigate and fix those too
 8. Stage and commit all changes with message: "fix: resolve issue #{{issueNumber}} - {{issueTitle}}"
 9. Push the branch to origin: `git push origin {{branchName}}`
-10. Create a pull request: gh pr create --title "fix: resolve issue #{{issueNumber}} - {{issueTitle}}" --body "Closes #{{issueNumber}}" --base main --head {{branchName}}
+
+The orchestrator opens the pull request for you after this step — do NOT run `gh pr create`.
 
 ## Rules
 

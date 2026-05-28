@@ -4,13 +4,14 @@ Automatically fixes GitHub issues using Claude Code agents, prioritized from hig
 
 ## How It Works
 
+0. **(Optional) Discovery** — when `DISCOVERY=true`, a scan agent reads the target repo within `DISCOVERY_SCOPE`, dedups against open issues, and files up to `DISCOVERY_MAX` new issues (agent-assigned severity), which then flow through the steps below in the same run
 1. Fetches open issues from your GitHub repo that have severity labels (`critical`, `high`, `medium`, `low`, or `bug`), paginating through all of them
 2. Sorts them by severity (critical first)
 3. For each issue, creates an isolated git worktree on a `fix/issue-{number}` branch
 4. Runs a **triage agent** (fast tier) to analyze the root cause
-5. Runs a **fix agent** (strong tier for critical/high, fast for medium/low) to implement the fix, commit, push, and open a PR (`gh pr create`)
-6. Validates the fix through ordered gates: **tests present** (a code change must add/modify a test, unless `REQUIRE_TESTS=false`) → **related tests pass** → **lint passes** (the repo's `lint` script or `LINT_COMMAND`); optionally **CI green** (`WAIT_FOR_CI=true` waits for the PR's GitHub checks)
-7. If `GREPTILE_API_KEY` is set, requests a **Greptile code review** and runs a **refinement agent** to address it; if refinement breaks tests it is reverted and the PR is flagged `needs-human-review`
+5. Runs a **fix agent** (strong tier for critical/high, fast for medium/low) to implement the fix, commit and push; the **orchestrator** then opens the PR
+6. Runs an **iterative fix→review loop** (up to `MAX_ITERATIONS`): validate ordered gates — **tests present** (a code change must add/modify a test, unless `REQUIRE_TESTS=false`) → **related tests pass** → **lint passes** — then **review** (Greptile or the reviewer provider). On any failing gate or blocking finding it reworks the fix and repeats; the fix is *confirmed* when gates pass and review has no blocking findings
+7. Optionally waits for **CI** to go green on the PR (`WAIT_FOR_CI=true`); unconfirmed fixes at the cap leave the PR flagged `needs-human-review`
 8. By default **leaves the open PR for a human to merge** (`AUTO_MERGE=false`). Set `AUTO_MERGE=true` to squash-merge confirmed PRs automatically and delete the branch
 9. Verifies a PR actually exists; a pushed fix with no PR is reported as `no-pr`, never `success`
 
@@ -49,6 +50,9 @@ cp .env.example .env
 | `REPO_LOCAL_PATH` | Absolute path to your local clone |
 | `MAX_CONCURRENCY` | Parallel agents (default: 3, max recommended: 5) |
 | `COST_CEILING_USD` | Stop processing after this spend **for the current run** (default: 50) |
+| `MAX_ITERATIONS` | Fix→review loop cap before leaving the PR for a human (default: 3) |
+| `DISCOVERY` | Set `true` to scan the repo and file new issues before processing (default off) |
+| `DISCOVERY_SCOPE` / `DISCOVERY_MAX` | Free-text discovery scope, and max new issues filed per run (default 5) |
 | `AUTO_MERGE` | Squash-merge confirmed PRs and delete the branch (default: `false` — leave for human review) |
 | `DEFAULT_PROVIDER` | Provider for triage/refine/discovery (`claude`/`codex`/`kimi`, default `claude`) |
 | `FIX_PROVIDER` / `REVIEW_PROVIDER` | Override the provider for the fix and reviewer roles |
@@ -83,6 +87,11 @@ npm run dry-run
 # Full run: processes issues with Claude agents
 npm start
 ```
+
+On a terminal, `npm start` opens an **interactive settings menu** (pre-filled
+from `.env`) to set providers, auto-merge, loop iterations, discovery, concurrency,
+and the cost ceiling, and to check provider readiness. Headless runs (no TTY,
+`--no-menu`, `NON_INTERACTIVE=true`, or dry-run) skip the menu and use `.env`.
 
 ## Output
 
@@ -129,16 +138,19 @@ github.js         → Fetches/paginates issues, sorts by severity, validates bra
 worktree.js       → Creates/removes isolated git worktrees + branches; detects package manager
 agent.js          → Runs agents (triage / fix / refinement / review) on the resolved provider
 providers.js      → Provider adapter registry (Claude/Codex/Kimi), role→model resolution, token-based cost
+discovery.js      → Optional scan → dedup → file new issues (ADR 0001)
+menu.js           → Interactive startup settings menu, auto-skipped when headless (ADR 0004)
 greptile.js       → Optional Greptile code review of the branch diff
 dispatcher.js     → Per-issue pipeline (triage → fix → validate → review/refine → merge-or-handoff),
                     concurrent work queue, per-run cost ceiling, terminal status resolution
 logger.js         → Per-run cost tracking + persisted run-log.json history
 ```
 
-The per-issue flow in `dispatcher.js`: triage → fix → validate (tests-present →
-tests-pass → lint gates) → (optional) Greptile review + refinement + re-validate →
-(optional) wait for CI → verify a PR exists → auto-merge if `AUTO_MERGE=true`
-(else leave open) → resolve terminal status.
+The per-issue flow in `dispatcher.js`: triage → fix → orchestrator opens the PR →
+**iterative loop (up to `MAX_ITERATIONS`)**: validate (tests-present → tests-pass
+→ lint) → review (Greptile or the reviewer provider) → rework on any failing gate
+or blocking finding → repeat until confirmed → (optional) wait for CI → auto-merge
+if `AUTO_MERGE=true` (else leave the open PR for a human) → resolve terminal status.
 
 Each agent runs in its own git worktree, so concurrent agents never interfere
 with each other's file changes. Worktrees are cleaned up after each agent

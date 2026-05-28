@@ -68,6 +68,24 @@ export async function fetchIssues(owner, repo) {
   return bugs.sort((a, b) => severityScore(a) - severityScore(b));
 }
 
+/** Create a GitHub issue (used by the discovery agent to file found bugs). */
+export async function createIssue(owner, repo, { title, body, labels = [] }) {
+  const { data } = await withRetry(
+    () => octokit.issues.create({ owner, repo, title, body, labels }),
+    `createIssue(${title})`,
+  );
+  return data;
+}
+
+/** Titles of all open issues (not PRs), for discovery dedup. */
+export async function fetchOpenIssueTitles(owner, repo) {
+  const issues = await withRetry(
+    () => octokit.paginate(octokit.issues.listForRepo, { owner, repo, state: 'open', per_page: 100 }),
+    'fetchOpenIssueTitles',
+  );
+  return issues.filter(i => !i.pull_request).map(i => i.title);
+}
+
 export function getSeverity(issue) {
   const labelNames = issue.labels.map(l => typeof l === 'string' ? l : l.name);
   for (const s of SEVERITY_ORDER) {
@@ -255,6 +273,21 @@ export async function getPrForBranch(owner, repo, branch) {
     `getPrForBranch(${branch})`,
   );
   return prs[0] || null;
+}
+
+/**
+ * Create the PR for a branch, or return the existing one (idempotent). The
+ * orchestrator owns PR creation so a PR reliably exists before the review loop
+ * and the human handoff (ADR 0003) — the fix agent no longer runs `gh pr create`.
+ */
+export async function createPr(owner, repo, branch, title, body, base = 'main') {
+  const existing = await getPrForBranch(owner, repo, branch);
+  if (existing) return existing;
+  const { data } = await withRetry(
+    () => octokit.pulls.create({ owner, repo, title, body, head: branch, base }),
+    `createPr(${branch})`,
+  );
+  return data;
 }
 
 /**
