@@ -62,7 +62,7 @@ ${diff}
   return formatGreptileResponse(data);
 }
 
-function getDiff(worktreeDir) {
+export function getDiff(worktreeDir) {
   try {
     // Committed changes vs origin/main
     const committed = execSync('git diff origin/main...HEAD', {

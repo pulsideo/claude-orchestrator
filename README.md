@@ -7,8 +7,8 @@ Automatically fixes GitHub issues using Claude Code agents, prioritized from hig
 1. Fetches open issues from your GitHub repo that have severity labels (`critical`, `high`, `medium`, `low`, or `bug`), paginating through all of them
 2. Sorts them by severity (critical first)
 3. For each issue, creates an isolated git worktree on a `fix/issue-{number}` branch
-4. Runs a **triage agent** (Sonnet) to analyze the root cause
-5. Runs a **fix agent** (Opus for critical/high, Sonnet for medium/low) to implement the fix, commit, push, and open a PR (`gh pr create`)
+4. Runs a **triage agent** (fast tier) to analyze the root cause
+5. Runs a **fix agent** (strong tier for critical/high, fast for medium/low) to implement the fix, commit, push, and open a PR (`gh pr create`)
 6. Validates the fix through ordered gates: **tests present** (a code change must add/modify a test, unless `REQUIRE_TESTS=false`) → **related tests pass** → **lint passes** (the repo's `lint` script or `LINT_COMMAND`); optionally **CI green** (`WAIT_FOR_CI=true` waits for the PR's GitHub checks)
 7. If `GREPTILE_API_KEY` is set, requests a **Greptile code review** and runs a **refinement agent** to address it; if refinement breaks tests it is reverted and the PR is flagged `needs-human-review`
 8. By default **leaves the open PR for a human to merge** (`AUTO_MERGE=false`). Set `AUTO_MERGE=true` to squash-merge confirmed PRs automatically and delete the branch
@@ -50,7 +50,14 @@ cp .env.example .env
 | `MAX_CONCURRENCY` | Parallel agents (default: 3, max recommended: 5) |
 | `COST_CEILING_USD` | Stop processing after this spend **for the current run** (default: 50) |
 | `AUTO_MERGE` | Squash-merge confirmed PRs and delete the branch (default: `false` — leave for human review) |
-| `GREPTILE_API_KEY` | Optional. Enables the Greptile review + refinement step. Omit to skip review |
+| `DEFAULT_PROVIDER` | Provider for triage/refine/discovery (`claude`/`codex`/`kimi`, default `claude`) |
+| `FIX_PROVIDER` / `REVIEW_PROVIDER` | Override the provider for the fix and reviewer roles |
+| `*_MODEL_STRONG` / `*_MODEL_FAST` | Override a provider's tier models (e.g. `CLAUDE_MODEL_STRONG`) |
+| `FIX_MODEL` / `REVIEW_MODEL` | Pin an exact model for the fix / reviewer role |
+| `MOONSHOT_API_KEY` / `KIMI_BASE_URL` | Kimi auth + endpoint (Kimi runs via the Claude CLI) |
+| `MODEL_PRICES` | Optional JSON override merged onto `prices.json` (USD per 1M tokens) |
+| `ENABLE_REVIEW` | Set `false` to skip code review entirely (default on) |
+| `GREPTILE_API_KEY` | Optional. Use Greptile as the reviewer instead of the review agent |
 | `PACKAGE_MANAGER` | Optional. Override worktree package-manager detection (`npm`/`pnpm`/`yarn`/`bun`). Auto-detected from the lockfile otherwise |
 | `EXTRA_TEST_DEPS` | Optional. Space-separated dev deps to install in the worktree; the manifest/lockfile are restored afterward so they never pollute the PR diff |
 | `REQUIRE_TESTS` | Reject a fix that changes code but adds/modifies no test (default: `true`) |
@@ -120,7 +127,8 @@ index.js          → Entry point, validates config, kicks off the queue, prints
 github.js         → Fetches/paginates issues, sorts by severity, validates branch tests,
                     finds/merges/flags PRs, deletes merged branches
 worktree.js       → Creates/removes isolated git worktrees + branches; detects package manager
-agent.js          → Spawns Claude Code CLI subprocesses (triage / fix / refinement); parses cost
+agent.js          → Runs agents (triage / fix / refinement / review) on the resolved provider
+providers.js      → Provider adapter registry (Claude/Codex/Kimi), role→model resolution, token-based cost
 greptile.js       → Optional Greptile code review of the branch diff
 dispatcher.js     → Per-issue pipeline (triage → fix → validate → review/refine → merge-or-handoff),
                     concurrent work queue, per-run cost ceiling, terminal status resolution
@@ -135,6 +143,26 @@ tests-pass → lint gates) → (optional) Greptile review + refinement + re-vali
 Each agent runs in its own git worktree, so concurrent agents never interfere
 with each other's file changes. Worktrees are cleaned up after each agent
 finishes (or crashes).
+
+## Providers
+
+Agents are provider-agnostic. A registry of adapters drives **Claude** (`claude -p`),
+**Codex** (`codex exec`), and **Kimi** (run through the Claude CLI against
+Moonshot's Anthropic-compatible endpoint). Provider is chosen per role:
+
+- `DEFAULT_PROVIDER` — triage, refinement, discovery
+- `FIX_PROVIDER` — the fix agent
+- `REVIEW_PROVIDER` — the reviewer
+
+So you can, e.g., fix with Claude and review with Codex or Kimi. Within a
+provider, issue severity selects a **strong** (critical/high) or **fast**
+(medium/low) model tier; both have defaults you can override.
+
+Cost is uniform across providers: adapters report **token usage**, which is
+priced via `prices.json` (USD per 1M tokens, override with `MODEL_PRICES`). The
+cost ceiling is checked against this estimate. Model IDs and prices for
+Codex/Kimi are best-effort defaults — verify them against your accounts. See
+`docs/adr/0006-provider-agnostic-adapters.md`.
 
 ## Tuning
 

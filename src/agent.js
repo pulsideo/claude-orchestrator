@@ -1,28 +1,13 @@
-import { execFile, execFileSync } from 'child_process';
-import { accessSync, constants, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { execFile } from 'child_process';
+import { readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import { getSeverity } from './github.js';
+import { resolveRole, resolveBin, estimateCost, loadPrices } from './providers.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROMPTS_DIR = join(__dirname, '..', 'prompts');
-
-// Resolve the full path to `claude` once at startup so spawned shells can find it
-// even when PATH doesn't include ~/.local/bin in non-interactive mode.
-let CLAUDE_BIN;
-try {
-  CLAUDE_BIN = execFileSync('which', ['claude'], { encoding: 'utf-8' }).trim();
-} catch {
-  // Fallback: check common install locations
-  const candidates = [
-    join(process.env.HOME || '', '.local', 'bin', 'claude'),
-    '/usr/local/bin/claude',
-  ];
-  CLAUDE_BIN = candidates.find(p => {
-    try { accessSync(p, constants.X_OK); return true; } catch { return false; }
-  }) || 'claude'; // last resort: hope PATH works at runtime
-}
 
 function loadPrompt(templateName, vars) {
   let template = readFileSync(join(PROMPTS_DIR, `${templateName}.md`), 'utf-8');
@@ -32,64 +17,44 @@ function loadPrompt(templateName, vars) {
   return template;
 }
 
-function modelForSeverity(severity) {
-  if (severity === 'critical' || severity === 'high') return 'opus';
-  return 'sonnet';
-}
+/**
+ * Run one agent on the provider/model resolved for its role + severity.
+ * Returns { output, usage, cost, provider, model, duration }. Cost is estimated
+ * from token usage via the price table (uniform across providers).
+ */
+export function runAgent({ role, severity, prompt, allowedTools = 'Bash,Read', cwd, timeout }) {
+  const { provider, adapter, model } = resolveRole(role, severity);
+  const bin = resolveBin(adapter);
 
-function runClaude({ prompt, model, allowedTools, cwd, timeout }) {
   return new Promise((resolve, reject) => {
-    const promptFile = join(tmpdir(), `claude-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
+    const promptFile = join(tmpdir(), `agent-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
     writeFileSync(promptFile, prompt);
-
     const start = Date.now();
 
-    // Strip CLAUDECODE env var so the subprocess doesn't think it's nested
-    const env = { ...process.env };
+    // Per-adapter env (e.g. Kimi points the Claude CLI at Moonshot). Strip
+    // CLAUDECODE so the subprocess doesn't think it's nested.
+    const env = { ...process.env, ...adapter.extraEnv(process.env) };
     delete env.CLAUDECODE;
 
-    execFile('bash', [
-      '-c',
-      `cat "${promptFile}" | ${CLAUDE_BIN} --model ${model} --output-format json --allowedTools "${allowedTools}" -p -`,
-    ], {
-      cwd,
-      timeout,
-      maxBuffer: 10 * 1024 * 1024,
-      env,
+    const command = adapter.command({ bin, model, allowedTools, promptFile });
+
+    execFile('bash', ['-c', command], {
+      cwd, timeout, maxBuffer: 10 * 1024 * 1024, env,
     }, (error, stdout, stderr) => {
       const duration = Date.now() - start;
-
-      // Clean up temp file
-      try { unlinkSync(promptFile); } catch {}
+      try { unlinkSync(promptFile); } catch { /* best effort */ }
 
       if (error) {
         const fullError = [error.message, stderr, stdout].filter(Boolean).join('\n');
-        reject({ error: fullError, duration });
+        reject({ error: fullError, duration, provider, model });
         return;
       }
 
-      const parsed = parseClaudeResult(stdout);
-      resolve({ ...parsed, duration });
+      const { output, usage } = adapter.parseOutput(stdout);
+      const cost = estimateCost(model, usage, loadPrices());
+      resolve({ output, usage, cost, provider, model, duration });
     });
   });
-}
-
-/**
- * Parse the JSON emitted by `claude --output-format json`.
- * The CLI field is `total_cost_usd` (verified against CLI 2.1.x); older
- * versions used `cost_usd`, kept as a fallback. Falls back to raw stdout when
- * the payload isn't valid JSON.
- */
-export function parseClaudeResult(stdout) {
-  try {
-    const result = JSON.parse(stdout);
-    return {
-      output: result.result || stdout,
-      cost: result.total_cost_usd ?? result.cost_usd ?? 0,
-    };
-  } catch {
-    return { output: stdout, cost: 0 };
-  }
 }
 
 export function runTriageAgent(issue, worktreeDir) {
@@ -99,9 +64,10 @@ export function runTriageAgent(issue, worktreeDir) {
     issueBody: issue.body || '(no description)',
   });
 
-  return runClaude({
+  return runAgent({
+    role: 'triage',
+    severity: getSeverity(issue),
     prompt,
-    model: 'sonnet',
     allowedTools: 'Bash,Read',
     cwd: worktreeDir,
     timeout: 300_000,
@@ -110,13 +76,10 @@ export function runTriageAgent(issue, worktreeDir) {
     analysis: result.output,
     cost: result.cost,
     duration: result.duration,
+    provider: result.provider,
+    model: result.model,
   })).catch(err => {
-    throw {
-      issueNumber: issue.number,
-      phase: 'triage',
-      error: err.error,
-      duration: err.duration,
-    };
+    throw { issueNumber: issue.number, phase: 'triage', error: err.error, duration: err.duration };
   });
 }
 
@@ -136,9 +99,10 @@ export function runRefinementAgent(issue, reviewComments, worktreeDir) {
     branchName: `fix/issue-${issue.number}`,
   });
 
-  return runClaude({
+  return runAgent({
+    role: 'refine',
+    severity: getSeverity(issue),
     prompt,
-    model: 'sonnet',
     allowedTools: 'Bash,Read,Write,Edit',
     cwd: worktreeDir,
     timeout: 300_000,
@@ -147,21 +111,16 @@ export function runRefinementAgent(issue, reviewComments, worktreeDir) {
     output: result.output,
     cost: result.cost,
     duration: result.duration,
+    provider: result.provider,
+    model: result.model,
   })).catch(err => {
-    throw {
-      issueNumber: issue.number,
-      phase: 'refine',
-      error: err.error,
-      duration: err.duration,
-    };
+    throw { issueNumber: issue.number, phase: 'refine', error: err.error, duration: err.duration };
   });
 }
 
 export function runFixAgent(issue, triageAnalysis, worktreeDir) {
   const severity = getSeverity(issue);
-  const templateName = (severity === 'critical' || severity === 'high')
-    ? 'fix-critical'
-    : 'fix-standard';
+  const templateName = (severity === 'critical' || severity === 'high') ? 'fix-critical' : 'fix-standard';
 
   const prompt = loadPrompt(templateName, {
     issueNumber: issue.number,
@@ -171,27 +130,53 @@ export function runFixAgent(issue, triageAnalysis, worktreeDir) {
     branchName: `fix/issue-${issue.number}`,
   });
 
-  const model = modelForSeverity(severity);
-
-  return runClaude({
+  return runAgent({
+    role: 'fix',
+    severity,
     prompt,
-    model,
     allowedTools: 'Bash,Read,Write,Edit',
     cwd: worktreeDir,
     timeout: 600_000,
   }).then(result => ({
     issueNumber: issue.number,
-    model,
+    model: result.model,
+    provider: result.provider,
     output: result.output,
     cost: result.cost,
     duration: result.duration,
   })).catch(err => {
-    throw {
-      issueNumber: issue.number,
-      phase: 'fix',
-      model,
-      error: err.error,
-      duration: err.duration,
-    };
+    throw { issueNumber: issue.number, phase: 'fix', model: err.model, error: err.error, duration: err.duration };
+  });
+}
+
+/**
+ * Review a fix's diff on the configured reviewer provider (REVIEW_PROVIDER),
+ * which may differ from the default provider. Returns review comments in the
+ * shape the refinement agent expects.
+ */
+export function runReviewAgent(issue, diff, worktreeDir) {
+  const prompt = loadPrompt('review', {
+    issueNumber: issue.number,
+    issueTitle: issue.title,
+    issueBody: issue.body || '(no description)',
+    diff: diff || '(no diff)',
+  });
+
+  return runAgent({
+    role: 'review',
+    severity: getSeverity(issue),
+    prompt,
+    allowedTools: 'Bash,Read',
+    cwd: worktreeDir,
+    timeout: 300_000,
+  }).then(result => ({
+    issueNumber: issue.number,
+    comments: result.output?.trim() ? [{ type: 'summary', body: result.output }] : [],
+    cost: result.cost,
+    duration: result.duration,
+    provider: result.provider,
+    model: result.model,
+  })).catch(err => {
+    throw { issueNumber: issue.number, phase: 'review', error: err.error, duration: err.duration };
   });
 }

@@ -33,10 +33,28 @@ One end-to-end invocation of the orchestrator: discover (optional) → process a
 prioritized queue of Issues → report. Cost is bounded per-run.
 _Avoid_: job, session, batch
 
+**Provider**:
+An AI backend the orchestrator drives to run an agent — Claude, Codex, or Kimi.
+Selected per role (default / fix / reviewer). Accessed only through an Adapter.
+_Avoid_: model, backend, LLM, vendor
+
+**Adapter**:
+The pluggable unit that knows how to invoke one Provider headlessly, parse its
+output into `{ output, token usage }`, and supply that Provider's default Model
+tiers. Kimi's adapter reuses the Claude CLI pointed at Moonshot's
+Anthropic-compatible endpoint (Kimi has no native agentic CLI).
+_Avoid_: driver, plugin, client
+
+**Model tier**:
+`strong` (used for critical/high Issues) or `fast` (medium/low). Severity picks
+the tier; each Provider declares default models for both, overridable in config.
+_Avoid_: size, level
+
 **Reviewer**:
 Whatever inspects a fix's diff and returns Findings. Greptile when
-`GREPTILE_API_KEY` is set, otherwise an in-worktree Claude review agent. The
-Reviewer gates the fix→review loop.
+`GREPTILE_API_KEY` is set, otherwise a review agent run on the configured
+reviewer Provider (which may differ from the default Provider — e.g. Claude for
+fixes, Codex for review). The Reviewer gates the fix→review loop.
 _Avoid_: code review bot, linter
 
 **Finding**:

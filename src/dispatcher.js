@@ -1,8 +1,8 @@
 import { execSync } from 'child_process';
 import { validateBranch, getSeverity, getPrForBranch, mergePr, flagForHumanReview, deleteRemoteBranch, waitForChecks } from './github.js';
 import { createWorktree, removeWorktree } from './worktree.js';
-import { runTriageAgent, runFixAgent, runRefinementAgent } from './agent.js';
-import { reviewWithGreptile } from './greptile.js';
+import { runTriageAgent, runFixAgent, runRefinementAgent, runReviewAgent } from './agent.js';
+import { reviewWithGreptile, getDiff } from './greptile.js';
 import { logResult, getRunCost, startRun } from './logger.js';
 
 const {
@@ -111,44 +111,54 @@ export async function processIssue(issue, repoPath, dryRun = false) {
     }
     console.log(`[VALIDATE] passed`);
 
-    // Phase 5: Greptile code review and refine
+    // Phase 5: code review (Greptile if configured, else the reviewer provider) + refine
     let refineCost = 0;
     let refineDuration = 0;
+    let reviewCost = 0;
     let refinementReverted = false;
-    if (process.env.GREPTILE_API_KEY) {
-      try {
+    let comments = [];
+    try {
+      if (process.env.GREPTILE_API_KEY) {
         console.log(`[REVIEW] Requesting Greptile code review...`);
-        const comments = await reviewWithGreptile(worktree.dir);
+        comments = await reviewWithGreptile(worktree.dir);
+      } else if (process.env.ENABLE_REVIEW !== 'false') {
+        const reviewProvider = process.env.REVIEW_PROVIDER || process.env.DEFAULT_PROVIDER || 'claude';
+        console.log(`[REVIEW] Reviewing with provider '${reviewProvider}'...`);
+        const review = await runReviewAgent(issue, getDiff(worktree.dir), worktree.dir);
+        comments = review.comments;
+        reviewCost = review.cost;
+        console.log(`[REVIEW] Done (${(review.duration / 1000).toFixed(1)}s, $${review.cost.toFixed(4)}, ${review.provider}/${review.model})`);
+      }
+    } catch (err) {
+      console.warn(`[REVIEW] Review failed: ${err.error || err.message}. Proceeding without review.`);
+      comments = [];
+    }
 
-        if (comments.length > 0) {
-          console.log(`[REVIEW] Got ${comments.length} Greptile comment(s). Running refinement agent...`);
-          try {
-            const refineResult = await runRefinementAgent(issue, comments, worktree.dir);
-            refineCost = refineResult.cost;
-            refineDuration = refineResult.duration;
-            console.log(`[REFINE] Done (${(refineDuration / 1000).toFixed(1)}s, $${refineCost})`);
+    if (comments.length > 0) {
+      console.log(`[REVIEW] Got ${comments.length} review comment(s). Running refinement agent...`);
+      try {
+        const refineResult = await runRefinementAgent(issue, comments, worktree.dir);
+        refineCost = refineResult.cost;
+        refineDuration = refineResult.duration;
+        console.log(`[REFINE] Done (${(refineDuration / 1000).toFixed(1)}s, $${refineCost})`);
 
-            // Re-validate after refinement
-            console.log(`[VALIDATE] Re-running tests after refinement...`);
-            const revalidation = await validateBranch(worktree.dir);
-            if (!revalidation.passed) {
-              console.log(`[VALIDATE] Refinement broke tests: ${revalidation.error}`);
-              console.log(`[REFINE] Reverting refinement commit...`);
-              execSync('git reset --hard HEAD~1', { cwd: worktree.dir, stdio: 'pipe' });
-              execSync(`git push origin ${worktree.branch} --force-with-lease`, { cwd: worktree.dir, stdio: 'pipe' });
-              refinementReverted = true;
-            } else {
-              console.log(`[VALIDATE] Still passing after refinement`);
-            }
-          } catch (err) {
-            console.warn(`[REFINE] Refinement failed: ${err.error || err.message}. Continuing with original fix.`);
-          }
+        // Re-validate after refinement
+        console.log(`[VALIDATE] Re-running validation after refinement...`);
+        const revalidation = await validateBranch(worktree.dir);
+        if (!revalidation.passed) {
+          console.log(`[VALIDATE] Refinement broke validation: ${revalidation.error}`);
+          console.log(`[REFINE] Reverting refinement commit...`);
+          execSync('git reset --hard HEAD~1', { cwd: worktree.dir, stdio: 'pipe' });
+          execSync(`git push origin ${worktree.branch} --force-with-lease`, { cwd: worktree.dir, stdio: 'pipe' });
+          refinementReverted = true;
         } else {
-          console.log(`[REVIEW] Greptile returned no comments. Proceeding with original fix.`);
+          console.log(`[VALIDATE] Still passing after refinement`);
         }
       } catch (err) {
-        console.warn(`[REVIEW] Greptile review failed: ${err.message}. Proceeding without review.`);
+        console.warn(`[REFINE] Refinement failed: ${err.error || err.message}. Continuing with original fix.`);
       }
+    } else {
+      console.log(`[REVIEW] No review comments. Proceeding with original fix.`);
     }
 
     // Phase 5.5: optional CI gate — wait for the PR's GitHub checks to go green
@@ -249,7 +259,7 @@ export async function processIssue(issue, repoPath, dryRun = false) {
     if (status === 'no-pr') {
       console.warn(`[PR] No pull request found for ${worktree.branch}. Fix is committed/pushed but no PR was opened — flagging as no-pr.`);
     }
-    const cost = (triageResult?.cost || 0) + (fixResult?.cost || 0) + refineCost;
+    const cost = (triageResult?.cost || 0) + (fixResult?.cost || 0) + reviewCost + refineCost;
     const totalCost = logResult(issue.number, {
       model: fixResult.model,
       cost,
