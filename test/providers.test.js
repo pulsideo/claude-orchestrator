@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { REGISTRY, resolveRole, estimateCost, loadPrices } from '../src/providers.js';
+import {
+  REGISTRY, resolveRole, estimateCost, loadPrices,
+  isCreditExhausted, buildSubprocessEnv, fallbackEnabled,
+  isApiKeyDisabled, disableApiKeyForRun, resetApiKeyFallback,
+} from '../src/providers.js';
 
 // --- output parsing --------------------------------------------------------
 
@@ -89,3 +93,44 @@ test('loadPrices ships defaults for the built-in models', () => {
 function pick({ provider, model }) {
   return { provider, model };
 }
+
+// --- API-key → subscription fallback ---------------------------------------
+
+test('isCreditExhausted matches the real 400 message, ignores unrelated errors', () => {
+  assert.equal(isCreditExhausted('Your credit balance is too low to access the Anthropic API.'), true);
+  assert.equal(isCreditExhausted('400 {"type":"error","error":{"message":"...credit balance is too low..."}}'), true);
+  assert.equal(isCreditExhausted('429 rate_limit_error: too many requests'), false);
+  assert.equal(isCreditExhausted('invalid x-api-key'), false);
+  assert.equal(isCreditExhausted(''), false);
+});
+
+test('fallbackEnabled is on by default, off only when explicitly false', () => {
+  assert.equal(fallbackEnabled({}), true);
+  assert.equal(fallbackEnabled({ FALLBACK_TO_SUBSCRIPTION: 'false' }), false);
+});
+
+test('buildSubprocessEnv strips CLAUDECODE and conditionally drops the API key', () => {
+  const base = { ANTHROPIC_API_KEY: 'sk-x', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', FOO: 'bar' };
+  const keep = buildSubprocessEnv(REGISTRY.claude, base, { dropApiKey: false });
+  assert.equal(keep.CLAUDECODE, undefined, 'CLAUDECODE always stripped');
+  assert.equal(keep.CLAUDE_CODE_ENTRYPOINT, undefined);
+  assert.equal(keep.ANTHROPIC_API_KEY, 'sk-x', 'key kept when not dropping');
+  assert.equal(keep.FOO, 'bar', 'unrelated vars preserved');
+
+  const dropped = buildSubprocessEnv(REGISTRY.claude, base, { dropApiKey: true });
+  assert.equal(dropped.ANTHROPIC_API_KEY, undefined, 'key dropped → CLI uses subscription');
+});
+
+test('the run-scoped latch flips on exhaustion and drives buildSubprocessEnv default', () => {
+  resetApiKeyFallback();
+  assert.equal(isApiKeyDisabled(), false);
+  // default dropApiKey follows the latch
+  assert.equal('ANTHROPIC_API_KEY' in buildSubprocessEnv(REGISTRY.claude, { ANTHROPIC_API_KEY: 'sk-x' }), true);
+
+  disableApiKeyForRun();
+  assert.equal(isApiKeyDisabled(), true);
+  assert.equal('ANTHROPIC_API_KEY' in buildSubprocessEnv(REGISTRY.claude, { ANTHROPIC_API_KEY: 'sk-x' }), false,
+    'once latched, the key is dropped by default for all later calls');
+
+  resetApiKeyFallback(); // don't leak latch state to other tests
+});

@@ -104,6 +104,59 @@ const codex = {
 
 export const REGISTRY = { claude, kimi, codex };
 
+// --- API-key → subscription fallback ---------------------------------------
+// When ANTHROPIC_API_KEY is set, the claude CLI bills the metered API. If that
+// key's credit runs out (HTTP 400 "credit balance is too low"), we can fall
+// back to the user's logged-in subscription by re-invoking the CLI WITHOUT the
+// key. Once tripped, a run-scoped latch drops the key for every later call so we
+// don't keep hammering the dead key. Requires the CLI to be logged into a
+// subscription for the fallback to actually authenticate.
+
+let apiKeyDisabled = false;
+
+/** Fallback is on by default; disable with FALLBACK_TO_SUBSCRIPTION=false. */
+export function fallbackEnabled(env = process.env) {
+  return env.FALLBACK_TO_SUBSCRIPTION !== 'false';
+}
+
+export function isApiKeyDisabled() {
+  return apiKeyDisabled;
+}
+
+/** Trip the latch (logs once) so the rest of the run uses the subscription. */
+export function disableApiKeyForRun() {
+  if (!apiKeyDisabled) {
+    apiKeyDisabled = true;
+    console.warn('[FALLBACK] Anthropic API credit exhausted — dropping ANTHROPIC_API_KEY and using the subscription login for the rest of this run (requires the claude CLI to be logged into a subscription).');
+  }
+}
+
+/** Reset the latch (new run / tests). */
+export function resetApiKeyFallback() {
+  apiKeyDisabled = false;
+}
+
+// Anthropic's exact 400 on an empty balance reads:
+//   "Your credit balance is too low to access the Anthropic API..."
+export function isCreditExhausted(text = '') {
+  return /credit balance is too low/i.test(String(text));
+}
+
+/**
+ * Build the env for a spawned provider CLI: per-adapter extras (e.g. Kimi's
+ * Moonshot endpoint) minus CLAUDECODE/CLAUDE_CODE_ENTRYPOINT so the child
+ * doesn't think it's nested. Drops ANTHROPIC_API_KEY when the fallback latch is
+ * tripped (or forced), so the claude CLI uses the subscription instead of the
+ * exhausted metered key.
+ */
+export function buildSubprocessEnv(adapter, baseEnv = process.env, { dropApiKey = apiKeyDisabled } = {}) {
+  const env = { ...baseEnv, ...adapter.extraEnv(baseEnv) };
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+  if (dropApiKey) delete env.ANTHROPIC_API_KEY;
+  return env;
+}
+
 // --- Role → provider/model resolution --------------------------------------
 
 const ROLE_TIER = { triage: 'fast', discovery: 'fast', refine: 'fast', review: 'strong' };

@@ -3,7 +3,10 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { getSeverity } from './github.js';
 import { loadPrompt } from './agent.js';
-import { resolveRole, resolveBin, REGISTRY } from './providers.js';
+import {
+  resolveRole, resolveBin, REGISTRY,
+  buildSubprocessEnv, fallbackEnabled, isApiKeyDisabled, disableApiKeyForRun, isCreditExhausted,
+} from './providers.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -125,16 +128,17 @@ export function buildWorkflowArgv(wfArgs, { budgetUsd, scriptPath = WORKFLOW_SCR
  * duration, provider, model, apiError }. `confirmed` is ADVISORY — the harness
  * re-runs validateBranch authoritatively before merging.
  */
-export function runFixWorkflow(issue, worktree, { severity, budgetUsd, env = process.env } = {}) {
+export function runFixWorkflow(issue, worktree, opts = {}) {
+  return runWorkflowAttempt(issue, worktree, opts, isApiKeyDisabled());
+}
+
+function runWorkflowAttempt(issue, worktree, { severity, budgetUsd, env = process.env } = {}, dropApiKey) {
   const sev = severity || getSeverity(issue);
   const wfArgs = buildWorkflowArgs(issue, worktree, sev, env);
   const argv = buildWorkflowArgv(wfArgs, { budgetUsd });
   const bin = resolveBin(REGISTRY.claude, env);
-
-  // Strip Claude Code's own env so the subprocess doesn't think it's nested.
-  const cliEnv = { ...env };
-  delete cliEnv.CLAUDECODE;
-  delete cliEnv.CLAUDE_CODE_ENTRYPOINT;
+  const cliEnv = buildSubprocessEnv(REGISTRY.claude, env, { dropApiKey });
+  const apiKeyWasActive = !dropApiKey && !!env.ANTHROPIC_API_KEY && fallbackEnabled(env);
 
   return new Promise((resolve, reject) => {
     const start = Date.now();
@@ -143,8 +147,18 @@ export function runFixWorkflow(issue, worktree, { severity, budgetUsd, env = pro
       timeout: WORKFLOW_TIMEOUT,
       maxBuffer: 64 * 1024 * 1024,
       env: cliEnv,
-    }, (error, stdout) => {
+    }, (error, stdout, stderr) => {
       const duration = Date.now() - start;
+
+      // API credit exhausted → drop the key and retry the whole workflow once
+      // on the subscription. Latched so later issues skip the dead key.
+      const blob = [stderr, stdout, error?.message].filter(Boolean).join('\n');
+      if (apiKeyWasActive && isCreditExhausted(blob)) {
+        disableApiKeyForRun();
+        runWorkflowAttempt(issue, worktree, { severity: sev, budgetUsd, env }, true).then(resolve, reject);
+        return;
+      }
+
       const result = parseWorkflowResult(stdout, error);
 
       // Hard failure with nothing parseable: surface as an error to the dispatcher.

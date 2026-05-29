@@ -192,6 +192,17 @@ cost ceiling is checked against this estimate. Model IDs and prices for
 Codex/Kimi are best-effort defaults — verify them against your accounts. See
 `docs/adr/0006-provider-agnostic-adapters.md`.
 
+**Claude auth & fallback.** The orchestrator runs the `claude` CLI, which uses
+your logged-in **subscription** unless `ANTHROPIC_API_KEY` is set (which switches
+it to metered API billing). If a key is set and its credit runs out (the CLI
+returns `400 "credit balance is too low"`), the run **drops the key and retries
+on your subscription**, latching for the rest of the run so it doesn't keep
+hitting the dead key — see `docs/adr/0008-api-key-subscription-fallback.md`. This
+requires the CLI to be logged into a subscription; disable with
+`FALLBACK_TO_SUBSCRIPTION=false`. There is no way to read a remaining API credit
+balance ahead of time — Anthropic exposes no such endpoint — so exhaustion is
+detected reactively from that error.
+
 ## Tuning
 
 - Start with `MAX_CONCURRENCY=2` and watch for rate limit errors (429s)

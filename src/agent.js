@@ -3,7 +3,10 @@ import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { getSeverity } from './github.js';
-import { resolveRole, resolveBin, estimateCost, loadPrices } from './providers.js';
+import {
+  resolveRole, resolveBin, estimateCost, loadPrices,
+  buildSubprocessEnv, fallbackEnabled, isApiKeyDisabled, disableApiKeyForRun, isCreditExhausted,
+} from './providers.js';
 
 // Model ids are passed as argv (no shell), but validate anyway as defense in
 // depth so a misconfigured override can't smuggle anything odd into the spawn.
@@ -25,7 +28,14 @@ export function loadPrompt(templateName, vars) {
  * Returns { output, usage, cost, provider, model, duration }. Cost is estimated
  * from token usage via the price table (uniform across providers).
  */
-export function runAgent({ role, severity, prompt, allowedTools = 'Bash,Read', cwd, timeout }) {
+export function runAgent(opts) {
+  // Start honoring the run-scoped latch: if the API key was already exhausted
+  // earlier this run, go straight to the subscription.
+  return runAgentAttempt(opts, isApiKeyDisabled());
+}
+
+function runAgentAttempt(opts, dropApiKey) {
+  const { role, severity, prompt, allowedTools = 'Bash,Read', cwd, timeout } = opts;
   const { provider, adapter, model } = resolveRole(role, severity);
   const bin = resolveBin(adapter);
 
@@ -36,10 +46,10 @@ export function runAgent({ role, severity, prompt, allowedTools = 'Bash,Read', c
     }
     const start = Date.now();
 
-    // Per-adapter env (e.g. Kimi points the Claude CLI at Moonshot). Strip
-    // CLAUDECODE so the subprocess doesn't think it's nested.
-    const env = { ...process.env, ...adapter.extraEnv(process.env) };
-    delete env.CLAUDECODE;
+    // Per-adapter env, minus CLAUDECODE; drops ANTHROPIC_API_KEY when falling
+    // back to the subscription (latch or forced retry).
+    const env = buildSubprocessEnv(adapter, process.env, { dropApiKey });
+    const apiKeyWasActive = !dropApiKey && !!process.env.ANTHROPIC_API_KEY && fallbackEnabled();
 
     // argv invocation (no shell); the prompt goes in via stdin, so nothing —
     // not the model, tool list, or untrusted issue content — is interpolated
@@ -58,6 +68,12 @@ export function runAgent({ role, severity, prompt, allowedTools = 'Bash,Read', c
       const duration = Date.now() - start;
       if (code !== 0) {
         const fullError = [stderr, stdout].filter(Boolean).join('\n') || `exited with code ${code}`;
+        // API credit exhausted → drop the key and retry once on the subscription.
+        if (apiKeyWasActive && isCreditExhausted(fullError)) {
+          disableApiKeyForRun();
+          runAgentAttempt(opts, true).then(resolve, reject);
+          return;
+        }
         reject({ error: fullError, duration, provider, model });
         return;
       }
