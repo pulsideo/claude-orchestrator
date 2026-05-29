@@ -162,7 +162,7 @@ export function isVitestReport(output) {
  * for both, so a crash that printed non-JSON would otherwise look like a pass.
  */
 function runVitest(worktreeDir, vitestCmd) {
-  let output = '';
+  let output;
   let threw = false;
   let detail = '';
   try {
