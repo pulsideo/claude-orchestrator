@@ -38,6 +38,12 @@ export function lockfileFor(pm) {
   return Object.keys(LOCKFILES).find(f => LOCKFILES[f] === pm) || '';
 }
 
+/** Combined stdout+stderr from a failed execSync error, trimmed and capped. */
+function cmdOutput(err) {
+  return [err.stdout?.toString(), err.stderr?.toString()]
+    .filter(Boolean).join('\n').trim().slice(0, 2000);
+}
+
 /**
  * Resolve the bin directory of the Node version the target repo pins
  * (.nvmrc / mise.toml / .tool-versions / engines.node), via mise. Returns null
@@ -146,10 +152,10 @@ function setupWorktree(repoPath, dir, branch, issueNumber) {
       });
     } catch (err) {
       // execSync's "Command failed: pnpm install" hides the real cause. Surface
-      // the captured stderr/stdout (e.g. ERR_PNPM_UNSUPPORTED_ENGINE) so the
-      // run log says why instead of just that it failed.
-      const detail = (err.stderr?.toString() || err.stdout?.toString() || '').trim();
-      throw new Error(`${pm} install failed${detail ? `: ${detail.slice(0, 2000)}` : `: ${err.message}`}`, { cause: err });
+      // the captured output (e.g. ERR_PNPM_UNSUPPORTED_ENGINE) so the run log
+      // says why instead of just that it failed.
+      const detail = cmdOutput(err);
+      throw new Error(`${pm} install failed${detail ? `: ${detail}` : `: ${err.message}`}`, { cause: err });
     }
 
     // Optionally install extra test deps the worktree needs but the manifest
@@ -170,6 +176,24 @@ function setupWorktree(repoPath, dir, branch, issueNumber) {
       } catch {
         // Nothing tracked to restore (e.g. lockfile was untracked) — fine.
       }
+    }
+  }
+
+  // Optional post-install setup, run once the worktree has its deps. Needed for
+  // monorepos whose tests import workspace packages by their built `dist/`
+  // exports: a fresh checkout has no build output, so without this the test gate
+  // crashes with "Failed to resolve entry for package …". Repo-specific; e.g.
+  // `pnpm turbo build --filter='./packages/@pulsideo/*'`. Default: none.
+  const setupCmd = (process.env.WORKTREE_SETUP_CMD || '').trim();
+  if (setupCmd) {
+    console.log(`[WORKTREE] Running setup for issue #${issueNumber}: ${setupCmd}`);
+    try {
+      execSync(setupCmd, { cwd: dir, stdio: 'pipe', timeout: 600_000 });
+    } catch (err) {
+      // Combine both streams: tools like turbo print the failing task's real
+      // error to stdout while stderr only carries the banner.
+      const detail = cmdOutput(err);
+      throw new Error(`worktree setup command failed${detail ? `: ${detail}` : `: ${err.message}`}`, { cause: err });
     }
   }
 
