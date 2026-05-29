@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { fetchIssues } from './github.js';
-import { runQueue } from './dispatcher.js';
+import { runQueue, resolvePerIssueBudget, checkBudgetConfig } from './dispatcher.js';
 import { cleanupAllWorktrees, resolveRepoNodeBin } from './worktree.js';
 import { delimiter } from 'path';
 import { runDiscovery } from './discovery.js';
@@ -40,6 +40,19 @@ async function main() {
   console.log(`Ceiling measures ${costModeLabel(process.env)}.`);
   console.log(`Discovery: ${process.env.DISCOVERY === 'true' ? `on (${process.env.DISCOVERY_SCOPE || 'whole repo'})` : 'off'}`);
   console.log(`Dry run: ${!!DRY_RUN}\n`);
+
+  // Config sanity check: an issue reserves a full per-issue budget before
+  // starting, so a budget bigger than the ceiling means nothing runs. Fail fast
+  // before discovery spends anything.
+  const perIssueBudget = resolvePerIssueBudget(costCeiling, concurrency, process.env);
+  const budgetCheck = checkBudgetConfig({ costCeiling, perIssueBudget, concurrency });
+  if (budgetCheck.level === 'error') {
+    console.error(`[CONFIG] ${budgetCheck.message}`);
+    process.exit(1);
+  }
+  if (budgetCheck.level === 'warn') {
+    console.warn(`[CONFIG] ${budgetCheck.message}\n`);
+  }
 
   // Surface a footgun: a non-Claude reviewer/default provider is ignored when
   // the Claude workflow brain runs (its sub-agents are always Claude).

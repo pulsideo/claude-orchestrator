@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveStatus, statusForStage, loopDecision } from '../src/dispatcher.js';
+import { resolveStatus, statusForStage, loopDecision, checkBudgetConfig, resolvePerIssueBudget } from '../src/dispatcher.js';
 import { parseReviewVerdict } from '../src/agent.js';
 
 // CRITIQUE #2: a passing fix with no PR must NOT be reported as success.
@@ -47,6 +47,37 @@ test('loopDecision: passing gates + no blocking findings = confirmed', () => {
 test('loopDecision: blocking findings rework while iterations remain, else unconfirmed', () => {
   assert.equal(loopDecision({ validationPassed: true, blocking: true, iteration: 2, maxIterations: 3 }), 'rework-review');
   assert.equal(loopDecision({ validationPassed: true, blocking: true, iteration: 3, maxIterations: 3 }), 'unconfirmed-blocking');
+});
+
+// --- budget config sanity check -------------------------------------------
+
+test('resolvePerIssueBudget: explicit override wins, else ceiling/concurrency', () => {
+  assert.equal(resolvePerIssueBudget(15, 3, { PER_ISSUE_BUDGET_USD: '5' }), 5);
+  assert.equal(resolvePerIssueBudget(15, 3, {}), 5);
+  assert.equal(resolvePerIssueBudget(15, 0, {}), 15); // guards against /0
+});
+
+test('checkBudgetConfig: errors when a per-issue budget exceeds the ceiling', () => {
+  const r = checkBudgetConfig({ costCeiling: 5, perIssueBudget: 8, concurrency: 3 });
+  assert.equal(r.level, 'error');
+  assert.equal(r.effectiveConcurrency, 0);
+});
+
+test('checkBudgetConfig: errors on non-positive ceiling or budget', () => {
+  assert.equal(checkBudgetConfig({ costCeiling: 0, perIssueBudget: 5, concurrency: 3 }).level, 'error');
+  assert.equal(checkBudgetConfig({ costCeiling: 15, perIssueBudget: 0, concurrency: 3 }).level, 'error');
+});
+
+test('checkBudgetConfig: warns when budget×concurrency exceeds ceiling, capping concurrency', () => {
+  const r = checkBudgetConfig({ costCeiling: 15, perIssueBudget: 10, concurrency: 3 });
+  assert.equal(r.level, 'warn');
+  assert.equal(r.effectiveConcurrency, 1); // floor(15/10)
+});
+
+test('checkBudgetConfig: ok at the boundary (default config)', () => {
+  const r = checkBudgetConfig({ costCeiling: 15, perIssueBudget: 5, concurrency: 3 });
+  assert.equal(r.level, 'ok');
+  assert.equal(r.effectiveConcurrency, 3);
 });
 
 // --- review verdict parsing ------------------------------------------------

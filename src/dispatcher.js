@@ -417,6 +417,44 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
   }
 }
 
+/**
+ * The per-issue budget: PER_ISSUE_BUDGET_USD if set, else the ceiling sliced
+ * across the worker pool. Single source of truth for runQueue and the startup
+ * config check.
+ */
+export function resolvePerIssueBudget(costCeiling, concurrency, env = process.env) {
+  return parseFloat(env.PER_ISSUE_BUDGET_USD || '0') || (costCeiling / Math.max(1, concurrency));
+}
+
+/**
+ * Sanity-check the budget config before a run. Because an issue now reserves a
+ * FULL per-issue budget before starting, perIssueBudget > ceiling means nothing
+ * can ever start (hard error); perIssueBudget * concurrency > ceiling means the
+ * pool can't all run at once, so effective concurrency drops (warning). Pure.
+ * Returns { level: 'ok'|'warn'|'error', message, effectiveConcurrency }.
+ */
+export function checkBudgetConfig({ costCeiling, perIssueBudget, concurrency }) {
+  if (!(perIssueBudget > 0) || !(costCeiling > 0)) {
+    return { level: 'error', message: `COST_CEILING_USD ($${costCeiling}) and the per-issue budget ($${perIssueBudget}) must both be positive.`, effectiveConcurrency: 0 };
+  }
+  if (perIssueBudget > costCeiling) {
+    return {
+      level: 'error',
+      message: `Per-issue budget ($${perIssueBudget.toFixed(2)}) exceeds COST_CEILING_USD ($${costCeiling.toFixed(2)}) — no issue can start. Lower PER_ISSUE_BUDGET_USD or raise the ceiling.`,
+      effectiveConcurrency: 0,
+    };
+  }
+  const effectiveConcurrency = Math.max(1, Math.min(concurrency, Math.floor(costCeiling / perIssueBudget)));
+  if (perIssueBudget * concurrency > costCeiling) {
+    return {
+      level: 'warn',
+      message: `Per-issue budget ($${perIssueBudget.toFixed(2)}) × concurrency (${concurrency}) = $${(perIssueBudget * concurrency).toFixed(2)} exceeds the $${costCeiling.toFixed(2)} ceiling — at most ${effectiveConcurrency} issue(s) will run at once before the ceiling blocks new starts.`,
+      effectiveConcurrency,
+    };
+  }
+  return { level: 'ok', message: '', effectiveConcurrency: concurrency };
+}
+
 export async function runQueue(issues, repoPath, concurrency, costCeiling, dryRun) {
   const queue = [...issues];
   const results = [];
@@ -430,7 +468,7 @@ export async function runQueue(issues, repoPath, concurrency, costCeiling, dryRu
   // path it bounds how many issues run at once. Default slices the ceiling
   // across the worker pool; override with PER_ISSUE_BUDGET_USD.
   const effConcurrency = Math.max(1, Math.min(concurrency, queue.length));
-  const perIssueBudget = parseFloat(process.env.PER_ISSUE_BUDGET_USD || '0') || (costCeiling / effConcurrency);
+  const perIssueBudget = resolvePerIssueBudget(costCeiling, effConcurrency);
 
   async function next() {
     while (queue.length > 0 && !stopped) {
