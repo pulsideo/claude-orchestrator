@@ -197,6 +197,32 @@ export function resolveRole(role, severity, env = process.env) {
   return { provider: providerName, adapter, model, tier };
 }
 
+/**
+ * The CLAUDE model a role/severity maps to, ignoring provider selection. The
+ * workflow brain's sub-agents are ALWAYS Claude, so REVIEW_PROVIDER/FIX_PROVIDER
+ * must not leak a non-Claude model id (e.g. gpt-5-codex) into a Claude agent()
+ * call. Still honors severity tiers and CLAUDE_MODEL_STRONG/FAST overrides.
+ */
+export function claudeModelForRole(role, severity, env = process.env) {
+  return modelFor(REGISTRY.claude, tierForRole(role, severity), env);
+}
+
+/**
+ * Warn when the workflow brain will run (USE_WORKFLOW + a Claude fix provider)
+ * but a non-Claude REVIEW_PROVIDER/DEFAULT_PROVIDER is set — those are ignored
+ * on the workflow path (its review/triage are Claude sub-agents). Returns the
+ * warning string, or null if there's nothing to warn about.
+ */
+export function workflowOverrideWarning(env = process.env) {
+  if (env.USE_WORKFLOW !== 'true') return null;
+  // If the fix provider can't host a workflow, the brain won't run — no warning.
+  if (!resolveRole('fix', 'high', env).adapter.supportsWorkflow) return null;
+  const reviewProvider = env.REVIEW_PROVIDER || env.DEFAULT_PROVIDER || 'claude';
+  const triageProvider = env.DEFAULT_PROVIDER || 'claude';
+  if (reviewProvider === 'claude' && triageProvider === 'claude') return null;
+  return `USE_WORKFLOW=true runs the Claude workflow brain — its triage/fix/review sub-agents are always Claude, so REVIEW_PROVIDER='${reviewProvider}' / DEFAULT_PROVIDER='${triageProvider}' are ignored on the workflow path. For cross-vendor review (e.g. Codex reviewing a Claude fix), set USE_WORKFLOW=false.`;
+}
+
 // --- Cost -------------------------------------------------------------------
 
 let pricesCache;

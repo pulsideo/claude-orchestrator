@@ -4,6 +4,7 @@ import { runQueue } from './dispatcher.js';
 import { cleanupAllWorktrees } from './worktree.js';
 import { runDiscovery } from './discovery.js';
 import { shouldShowMenu, runMenu } from './menu.js';
+import { workflowOverrideWarning } from './providers.js';
 
 const {
   GITHUB_TOKEN,
@@ -37,6 +38,11 @@ async function main() {
   console.log(`Concurrency: ${concurrency} | Cost ceiling: $${costCeiling} | Max iterations: ${process.env.MAX_ITERATIONS || '3'} | Auto-merge: ${process.env.AUTO_MERGE || 'false'}`);
   console.log(`Discovery: ${process.env.DISCOVERY === 'true' ? `on (${process.env.DISCOVERY_SCOPE || 'whole repo'})` : 'off'}`);
   console.log(`Dry run: ${!!DRY_RUN}\n`);
+
+  // Surface a footgun: a non-Claude reviewer/default provider is ignored when
+  // the Claude workflow brain runs (its sub-agents are always Claude).
+  const wfWarning = workflowOverrideWarning(process.env);
+  if (wfWarning) console.warn(`[WORKFLOW] ${wfWarning}\n`);
 
   // Clean up any leftover worktrees from previous runs
   console.log(`[INIT] Cleaning stale worktrees...`);

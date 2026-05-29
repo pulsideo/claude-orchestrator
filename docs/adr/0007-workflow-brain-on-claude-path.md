@@ -27,6 +27,14 @@ runs only when the **fix provider is Claude** (`adapter.supportsWorkflow`) and
 `USE_WORKFLOW=true`. Codex/Kimi keep the hand-rolled pipeline. This preserves the
 cross-vendor moat (e.g. Codex reviewing a Claude fix) — see ADR 0006.
 
+Because the workflow's triage/fix/review sub-agents are **always Claude**, their
+models resolve via `claudeModelForRole` (Claude tiers + `CLAUDE_MODEL_*`),
+**not** `resolveRole` — otherwise a non-Claude `REVIEW_PROVIDER`/`FIX_PROVIDER`
+would leak a model id like `gpt-5-codex` into a Claude `agent()` call. So
+cross-vendor review and the workflow brain are mutually exclusive: to have Codex
+review a Claude fix, set `USE_WORKFLOW=false`. `workflowOverrideWarning` surfaces
+this at startup if a non-Claude reviewer is configured alongside the workflow.
+
 ## Invocation contract (verified, CLI v2.1.154)
 
 `runFixWorkflow` (`src/workflow.js`) is the single swappable seam — moving to the

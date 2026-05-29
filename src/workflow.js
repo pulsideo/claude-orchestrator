@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import { getSeverity } from './github.js';
 import { loadPrompt } from './agent.js';
 import {
-  resolveRole, resolveBin, REGISTRY,
+  claudeModelForRole, resolveBin, REGISTRY,
   buildSubprocessEnv, fallbackEnabled, isApiKeyDisabled, disableApiKeyForRun, isCreditExhausted,
 } from './providers.js';
 
@@ -58,10 +58,12 @@ export function buildWorkflowArgs(issue, worktree, severity, env = process.env) 
     severity,
     maxIterations: Math.max(1, parseInt(env.MAX_ITERATIONS || '3', 10) || 3),
     tokenBudget,
+    // Always Claude models — the workflow's sub-agents are Claude, so a
+    // non-Claude REVIEW_PROVIDER/FIX_PROVIDER must not leak its model id here.
     models: {
-      triage: resolveRole('triage', severity, env).model,
-      fix: resolveRole('fix', severity, env).model,
-      review: resolveRole('review', severity, env).model,
+      triage: claudeModelForRole('triage', severity, env),
+      fix: claudeModelForRole('fix', severity, env),
+      review: claudeModelForRole('review', severity, env),
     },
     triagePrompt: loadPrompt('triage', ctx),
     fixPrompt: loadPrompt(fixTemplate, { ...ctx, branchName }),

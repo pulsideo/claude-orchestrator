@@ -4,6 +4,7 @@ import {
   REGISTRY, resolveRole, estimateCost, loadPrices,
   isCreditExhausted, buildSubprocessEnv, fallbackEnabled,
   isApiKeyDisabled, disableApiKeyForRun, resetApiKeyFallback,
+  claudeModelForRole, workflowOverrideWarning,
 } from '../src/providers.js';
 
 // --- output parsing --------------------------------------------------------
@@ -133,4 +134,30 @@ test('the run-scoped latch flips on exhaustion and drives buildSubprocessEnv def
     'once latched, the key is dropped by default for all later calls');
 
   resetApiKeyFallback(); // don't leak latch state to other tests
+});
+
+// --- workflow brain models stay Claude regardless of provider overrides -----
+
+test('claudeModelForRole resolves Claude tier models, ignoring REVIEW_/FIX_PROVIDER', () => {
+  // Severity tiers: review = strong, triage = fast, fix = severity-gated.
+  assert.equal(claudeModelForRole('review', 'low', {}), 'opus');
+  assert.equal(claudeModelForRole('triage', 'high', {}), 'sonnet');
+  assert.equal(claudeModelForRole('fix', 'critical', {}), 'opus');
+  assert.equal(claudeModelForRole('fix', 'low', {}), 'sonnet');
+  // A non-Claude review provider must NOT leak its model id (the old bug).
+  assert.equal(claudeModelForRole('review', 'low', { REVIEW_PROVIDER: 'codex' }), 'opus');
+  // CLAUDE_MODEL_* overrides still apply.
+  assert.equal(claudeModelForRole('fix', 'critical', { CLAUDE_MODEL_STRONG: 'opus-4-8' }), 'opus-4-8');
+});
+
+test('workflowOverrideWarning fires only when a non-Claude reviewer is ignored by the workflow', () => {
+  assert.equal(workflowOverrideWarning({}), null, 'no workflow → no warning');
+  assert.equal(workflowOverrideWarning({ USE_WORKFLOW: 'true' }), null, 'all-Claude → no warning');
+  // Non-Claude reviewer + workflow on + Claude fix provider → warn.
+  assert.match(
+    workflowOverrideWarning({ USE_WORKFLOW: 'true', REVIEW_PROVIDER: 'codex' }) || '',
+    /ignored on the workflow path/,
+  );
+  // If the fix provider can't host a workflow, the brain won't run → no warning.
+  assert.equal(workflowOverrideWarning({ USE_WORKFLOW: 'true', REVIEW_PROVIDER: 'codex', FIX_PROVIDER: 'codex' }), null);
 });
