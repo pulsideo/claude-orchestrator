@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { severityScore, getSeverity, parseFailedTests } from '../src/github.js';
+import { severityScore, getSeverity, parseFailedTests, isVitestReport } from '../src/github.js';
 
 const issue = (...labels) => ({ labels: labels.map(name => ({ name })) });
 
@@ -39,4 +39,14 @@ test('parseFailedTests extracts failed assertion names', () => {
 
 test('parseFailedTests returns [] on non-JSON', () => {
   assert.deepEqual(parseFailedTests('garbage'), []);
+});
+
+test('isVitestReport distinguishes a real report from a crash', () => {
+  // A real run (even with zero failures) is a report.
+  assert.equal(isVitestReport(JSON.stringify({ testResults: [] })), true);
+  assert.equal(isVitestReport(JSON.stringify({ testResults: [{ assertionResults: [] }] })), true);
+  // A crash before tests run: empty output, non-JSON, or JSON without testResults.
+  assert.equal(isVitestReport(''), false);
+  assert.equal(isVitestReport('Failed to resolve entry for package "@x/y"'), false);
+  assert.equal(isVitestReport(JSON.stringify({ error: 'boom' })), false);
 });

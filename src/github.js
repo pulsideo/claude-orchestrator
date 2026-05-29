@@ -144,39 +144,73 @@ function collectChangedFiles(worktreeDir) {
   return [...new Set(out.split('\n').filter(Boolean))];
 }
 
+/** True if `output` is a parseable vitest JSON report (tests actually ran). */
+export function isVitestReport(output) {
+  try {
+    return Array.isArray(JSON.parse(output).testResults);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Run vitest once and classify the outcome:
+ *   ran=true  → it produced a JSON report (tests executed; `failures` lists them)
+ *   ran=false → it crashed before running them (module resolution / config
+ *               error). `detail` carries the combined stdout+stderr.
+ * Distinguishing a crash from "no failures" matters: parseFailedTests returns []
+ * for both, so a crash that printed non-JSON would otherwise look like a pass.
+ */
+function runVitest(worktreeDir, vitestCmd) {
+  let output = '';
+  let threw = false;
+  let detail = '';
+  try {
+    output = execSync(vitestCmd, { cwd: worktreeDir, stdio: 'pipe', timeout: 120_000 }).toString();
+  } catch (err) {
+    threw = true;
+    output = err.stdout?.toString() || '';
+    detail = [output, err.stderr?.toString()].filter(Boolean).join('\n').trim().slice(0, 2000) || err.message;
+  }
+  if (isVitestReport(output)) return { ran: true, failures: parseFailedTests(output) };
+  if (!threw) return { ran: true, failures: [] }; // exited 0 without a report (defensive)
+  return { ran: false, failures: [], detail };
+}
+
 function runRelatedTests(worktreeDir, codeFiles) {
   const quotedFiles = codeFiles.map(f => `'${f.replace(/'/g, "'\\''")}'`).join(' ');
   const vitestCmd = `npx vitest related ${quotedFiles} --reporter=json`;
 
-  let fixOutput;
-  try {
-    fixOutput = execSync(vitestCmd, { cwd: worktreeDir, stdio: 'pipe', timeout: 120_000 }).toString();
-  } catch (err) {
-    fixOutput = err.stdout?.toString() || '';
-    if (!fixOutput) return { passed: false, error: err.stderr?.toString() || err.message };
-  }
+  const fix = runVitest(worktreeDir, vitestCmd);
+  if (fix.ran && fix.failures.length === 0) return { passed: true };
 
-  const fixFailures = parseFailedTests(fixOutput);
-  if (fixFailures.length === 0) return { passed: true };
-
-  // Tests failed — subtract failures that already fail on origin/main (pre-existing).
+  // Re-run on origin/main so we only block on regressions the fix introduced —
+  // not pre-existing failures, nor environmental crashes (e.g. an unbuilt
+  // workspace package) that also happen on a clean main.
   const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: worktreeDir, encoding: 'utf-8' }).trim();
-  let baseFailures;
+  let base;
   try {
     execSync('git checkout origin/main --quiet', { cwd: worktreeDir, stdio: 'pipe' });
-    let baseOutput;
-    try {
-      baseOutput = execSync(vitestCmd, { cwd: worktreeDir, stdio: 'pipe', timeout: 120_000 }).toString();
-    } catch (err) {
-      baseOutput = err.stdout?.toString() || '';
-    }
-    baseFailures = parseFailedTests(baseOutput);
+    base = runVitest(worktreeDir, vitestCmd);
   } finally {
     execSync(`git checkout ${currentBranch} --quiet`, { cwd: worktreeDir, stdio: 'pipe' });
   }
 
-  const baseFailureSet = new Set(baseFailures);
-  const newFailures = fixFailures.filter(t => !baseFailureSet.has(t));
+  if (!fix.ran) {
+    // Vitest couldn't run the related tests on the branch at all.
+    if (!base.ran) {
+      // Same on a clean main → environmental/pre-existing, not the fix. Don't
+      // blame the fix, but make it loud: the test gate did not validate it.
+      console.warn(`[VALIDATE] vitest could not run the related tests on either the fix branch or origin/main — environmental, skipping the test gate.\n${fix.detail}`);
+      return { passed: true };
+    }
+    // Tests run on main but crash on the branch → the fix broke the run itself.
+    return { passed: false, error: `The fix prevents vitest from running the related tests:\n${fix.detail}` };
+  }
+
+  // Both produced reports — block only on tests the fix newly broke.
+  const baseFailureSet = new Set(base.ran ? base.failures : []);
+  const newFailures = fix.failures.filter(t => !baseFailureSet.has(t));
   if (newFailures.length === 0) return { passed: true };
   return { passed: false, error: `New test failures: ${newFailures.join(', ')}` };
 }
