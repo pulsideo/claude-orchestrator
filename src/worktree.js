@@ -109,8 +109,30 @@ export function createWorktree(repoPath, issueNumber) {
   }
 }
 
+/**
+ * Trust the worktree's mise config (best-effort). The workflow brain runs the
+ * mise-shimmed `claude` with cwd set to the worktree; an untrusted mise.toml
+ * there makes mise abort before claude starts. Trusting also lets mise activate
+ * the repo-pinned toolchain for the agent's own subprocesses. No-op when mise
+ * or a config is absent.
+ */
+function trustMiseConfig(dir) {
+  const cfg = ['mise.toml', '.mise.toml', '.tool-versions']
+    .map(f => join(dir, f))
+    .find(existsSync);
+  if (!cfg) return;
+  try {
+    execSync(`mise trust "${cfg}"`, { stdio: 'pipe' });
+  } catch {
+    // mise not installed or trust failed — the PATH-prepended Node still covers
+    // the orchestrator's own commands; only the shimmed agent is affected.
+  }
+}
+
 /** Post-creation setup (deps + env files) for a freshly-added worktree. */
 function setupWorktree(repoPath, dir, branch, issueNumber) {
+  trustMiseConfig(dir);
+
   // Install deps using the target repo's own package manager (auto-detected,
   // overridable via PACKAGE_MANAGER) instead of assuming pnpm (CRITIQUE #3).
   if (existsSync(join(dir, 'package.json'))) {
@@ -164,6 +186,15 @@ function setupWorktree(repoPath, dir, branch, issueNumber) {
 }
 
 export function removeWorktree(repoPath, dir, branch) {
+  // Drop the mise trust entry we added for this worktree so they don't
+  // accumulate as the worktree dir is unique per run. Best-effort, before the
+  // dir disappears.
+  for (const f of ['mise.toml', '.mise.toml', '.tool-versions']) {
+    const cfg = join(dir, f);
+    if (!existsSync(cfg)) continue;
+    try { execSync(`mise trust --untrust "${cfg}"`, { stdio: 'pipe' }); } catch { /* best effort */ }
+  }
+
   try {
     execSync(`git worktree remove "${dir}" --force`, {
       cwd: repoPath,
