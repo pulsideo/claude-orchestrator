@@ -8,9 +8,10 @@
   "scripts": {
     "start": "node src/index.js",
     "dry-run": "DRY_RUN=true node src/index.js",
-    "lint": "eslint src test eslint.config.js",
-    "lint:fix": "eslint src test eslint.config.js --fix",
-    "test": "node --test"
+    "lint": "eslint src test scripts eslint.config.js",
+    "lint:fix": "eslint src test scripts eslint.config.js --fix",
+    "test": "node --test",
+    "e2e": "node scripts/e2e-workflow.mjs"
   },
   "dependencies": {
     "@octokit/rest": "^21.0.0",
