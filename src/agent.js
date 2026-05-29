@@ -1,15 +1,18 @@
-import { execFile } from 'child_process';
-import { readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { spawn } from 'child_process';
+import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
-import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import { getSeverity } from './github.js';
 import { resolveRole, resolveBin, estimateCost, loadPrices } from './providers.js';
 
+// Model ids are passed as argv (no shell), but validate anyway as defense in
+// depth so a misconfigured override can't smuggle anything odd into the spawn.
+const MODEL_RE = /^[A-Za-z0-9._:/-]+$/;
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROMPTS_DIR = join(__dirname, '..', 'prompts');
 
-function loadPrompt(templateName, vars) {
+export function loadPrompt(templateName, vars) {
   let template = readFileSync(join(PROMPTS_DIR, `${templateName}.md`), 'utf-8');
   for (const [key, value] of Object.entries(vars)) {
     template = template.replaceAll(`{{${key}}}`, String(value));
@@ -27,8 +30,10 @@ export function runAgent({ role, severity, prompt, allowedTools = 'Bash,Read', c
   const bin = resolveBin(adapter);
 
   return new Promise((resolve, reject) => {
-    const promptFile = join(tmpdir(), `agent-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
-    writeFileSync(promptFile, prompt);
+    if (!MODEL_RE.test(model)) {
+      reject({ error: `Refusing to run: invalid model id '${model}'`, duration: 0, provider, model });
+      return;
+    }
     const start = Date.now();
 
     // Per-adapter env (e.g. Kimi points the Claude CLI at Moonshot). Strip
@@ -36,24 +41,34 @@ export function runAgent({ role, severity, prompt, allowedTools = 'Bash,Read', c
     const env = { ...process.env, ...adapter.extraEnv(process.env) };
     delete env.CLAUDECODE;
 
-    const command = adapter.command({ bin, model, allowedTools, promptFile });
+    // argv invocation (no shell); the prompt goes in via stdin, so nothing —
+    // not the model, tool list, or untrusted issue content — is interpolated
+    // into a command string. Also removes the temp-prompt-file lifecycle.
+    const args = adapter.command({ model, allowedTools });
+    const child = spawn(bin, args, { cwd, env, timeout });
 
-    execFile('bash', ['-c', command], {
-      cwd, timeout, maxBuffer: 10 * 1024 * 1024, env,
-    }, (error, stdout, stderr) => {
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', (err) => {
+      reject({ error: err.message, duration: Date.now() - start, provider, model });
+    });
+    child.on('close', (code) => {
       const duration = Date.now() - start;
-      try { unlinkSync(promptFile); } catch { /* best effort */ }
-
-      if (error) {
-        const fullError = [error.message, stderr, stdout].filter(Boolean).join('\n');
+      if (code !== 0) {
+        const fullError = [stderr, stdout].filter(Boolean).join('\n') || `exited with code ${code}`;
         reject({ error: fullError, duration, provider, model });
         return;
       }
-
       const { output, usage } = adapter.parseOutput(stdout);
       const cost = estimateCost(model, usage, loadPrices());
       resolve({ output, usage, cost, provider, model, duration });
     });
+
+    child.stdin.on('error', () => { /* ignore EPIPE if the child exits early */ });
+    child.stdin.write(prompt);
+    child.stdin.end();
   });
 }
 

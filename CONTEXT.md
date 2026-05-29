@@ -67,6 +67,15 @@ The iteration `fix → run tests → review` that repeats until the fix is
 Confirmed or the iteration cap is hit.
 _Avoid_: refinement, retry
 
+**Workflow brain**:
+The Claude-only alternative to the hand-rolled Fix→review loop: one headless
+`claude` invocation of a saved dynamic workflow (`.claude/workflows/fix-issue.js`)
+that runs triage, the fix, and an adversarial-review convergence loop in a single
+session. Enabled by `USE_WORKFLOW` when the fix Provider is Claude; its
+`confirmed` is advisory — the harness re-runs the Validation gate authoritatively
+(ADR 0007). Codex/Kimi always use the hand-rolled loop.
+_Avoid_: agent, the workflow (lowercase), orchestration
+
 **Confirmed**:
 The state of a fix that has passed every enabled Validation gate AND has zero
 blocking Findings. A Confirmed fix's PR is left open for a human (or auto-merged

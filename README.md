@@ -54,6 +54,9 @@ cp .env.example .env
 | `DISCOVERY` | Set `true` to scan the repo and file new issues before processing (default off) |
 | `DISCOVERY_SCOPE` / `DISCOVERY_MAX` | Free-text discovery scope, and max new issues filed per run (default 5) |
 | `AUTO_MERGE` | Squash-merge confirmed PRs and delete the branch (default: `false` — leave for human review) |
+| `USE_WORKFLOW` | Run the per-issue brain as a Claude dynamic workflow (triage→fix→adversarial-review convergence) instead of the hand-rolled loop. Claude fix-provider only; Codex/Kimi unaffected (default: `false`, see ADR 0007) |
+| `PER_ISSUE_BUDGET_USD` | USD reserved per issue before it starts (caps concurrent overspend) and passed to the workflow as a hard `--max-budget-usd`. Default: `COST_CEILING_USD` ÷ effective concurrency |
+| `PER_ISSUE_TOKEN_BUDGET` | Optional in-workflow token backstop on the convergence loop |
 | `DEFAULT_PROVIDER` | Provider for triage/refine/discovery (`claude`/`codex`/`kimi`, default `claude`) |
 | `FIX_PROVIDER` / `REVIEW_PROVIDER` | Override the provider for the fix and reviewer roles |
 | `*_MODEL_STRONG` / `*_MODEL_FAST` | Override a provider's tier models (e.g. `CLAUDE_MODEL_STRONG`) |
@@ -137,13 +140,17 @@ github.js         → Fetches/paginates issues, sorts by severity, validates bra
                     finds/merges/flags PRs, deletes merged branches
 worktree.js       → Creates/removes isolated git worktrees + branches; detects package manager
 agent.js          → Runs agents (triage / fix / refinement / review) on the resolved provider
+workflow.js       → Claude-only "workflow brain": invokes the saved fix-issue dynamic workflow
+                    headlessly, parses its structured result + real total_cost_usd (ADR 0007)
 providers.js      → Provider adapter registry (Claude/Codex/Kimi), role→model resolution, token-based cost
 discovery.js      → Optional scan → dedup → file new issues (ADR 0001)
 menu.js           → Interactive startup settings menu, auto-skipped when headless (ADR 0004)
 greptile.js       → Optional Greptile code review of the branch diff
-dispatcher.js     → Per-issue pipeline (triage → fix → validate → review/refine → merge-or-handoff),
-                    concurrent work queue, per-run cost ceiling, terminal status resolution
-logger.js         → Per-run cost tracking + persisted run-log.json history
+dispatcher.js     → Per-issue pipeline (brain → validate → merge-or-handoff), concurrent work
+                    queue with per-issue budget reservation, per-run cost ceiling, status resolution
+logger.js         → Per-run cost tracking + reservation + persisted run-log.json history
+.claude/workflows/fix-issue.js → The dynamic workflow brain (triage → fix → adversarial-review
+                    convergence), run when USE_WORKFLOW=true on the Claude path
 ```
 
 The per-issue flow in `dispatcher.js`: triage → fix → orchestrator opens the PR →
@@ -151,6 +158,15 @@ The per-issue flow in `dispatcher.js`: triage → fix → orchestrator opens the
 → lint) → review (Greptile or the reviewer provider) → rework on any failing gate
 or blocking finding → repeat until confirmed → (optional) wait for CI → auto-merge
 if `AUTO_MERGE=true` (else leave the open PR for a human) → resolve terminal status.
+
+**Workflow brain (`USE_WORKFLOW=true`, Claude fix-provider only).** Instead of the
+hand-rolled loop, the brain runs as a single Claude dynamic workflow
+(`.claude/workflows/fix-issue.js`): triage → fix → a convergence loop with
+**adversarial review** (independent correctness/security/edge-case lenses, each
+returning a structured verdict — a fix is confirmed only when none find a blocking
+defect, so review fails *closed*). The workflow's `confirmed` is advisory; the
+harness still runs `validateBranch` authoritatively before merging, and CI/merge/
+handoff are unchanged. Codex/Kimi always use the hand-rolled loop. See ADR 0007.
 
 Each agent runs in its own git worktree, so concurrent agents never interfere
 with each other's file changes. Worktrees are cleaned up after each agent

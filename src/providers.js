@@ -26,8 +26,11 @@ function parseClaudeJson(stdout) {
   }
 }
 
-function claudeStyleCommand({ bin, model, allowedTools, promptFile }) {
-  return `cat "${promptFile}" | ${bin} --model ${model} --output-format json --allowedTools "${allowedTools}" -p -`;
+// Returns argv (excluding the binary). The prompt is fed via the child's stdin,
+// never interpolated into a shell string — so untrusted issue content and the
+// model/tool names cannot inject shell commands.
+function claudeStyleCommand({ model, allowedTools }) {
+  return ['--model', model, '--output-format', 'json', '--allowedTools', allowedTools, '-p'];
 }
 
 // --- Provider adapters -----------------------------------------------------
@@ -43,6 +46,9 @@ const claude = {
   command: claudeStyleCommand,
   extraEnv() { return {}; },
   parseOutput: parseClaudeJson,
+  // Only Claude can host a dynamic workflow (its sub-agents are Claude). The
+  // workflow brain is gated on this; Codex/Kimi keep the hand-rolled pipeline.
+  supportsWorkflow: true,
 };
 
 // Kimi (Moonshot K2) has no native agentic CLI; drive it through the Claude CLI
@@ -67,9 +73,9 @@ const codex = {
   defaultModels: { strong: 'gpt-5-codex', fast: 'gpt-5-codex' },
   binEnv: 'CODEX_BIN',
   binCandidates: ['codex'],
-  command({ bin, model, promptFile }) {
-    // codex exec reads the prompt from stdin; --json emits JSONL events.
-    return `cat "${promptFile}" | ${bin} exec --json --model ${model} --dangerously-bypass-approvals-and-sandbox -`;
+  command({ model }) {
+    // codex exec reads the prompt from stdin (trailing `-`); --json emits JSONL.
+    return ['exec', '--json', '--model', model, '--dangerously-bypass-approvals-and-sandbox', '-'];
   },
   extraEnv() { return {}; },
   parseOutput(stdout) {

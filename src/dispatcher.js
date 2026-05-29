@@ -2,8 +2,10 @@ import { execSync } from 'child_process';
 import { validateBranch, getSeverity, getPrForBranch, createPr, mergePr, flagForHumanReview, deleteRemoteBranch, waitForChecks } from './github.js';
 import { createWorktree, removeWorktree } from './worktree.js';
 import { runTriageAgent, runFixAgent, runReworkAgent, runReviewAgent } from './agent.js';
+import { resolveRole } from './providers.js';
+import { runFixWorkflow } from './workflow.js';
 import { reviewWithGreptile, getDiff } from './greptile.js';
-import { logResult, getRunCost, startRun } from './logger.js';
+import { logResult, getRunCost, startRun, reserveBudget, releaseBudget, getCommittedCost } from './logger.js';
 
 const {
   GITHUB_OWNER,
@@ -86,6 +88,35 @@ function pushBranch(worktree) {
   }
 }
 
+/** Whether the workflow brain should run for this severity (Claude fix provider + opted in). */
+export function useWorkflowBrain(severity, env = process.env) {
+  if (env.USE_WORKFLOW !== 'true') return false;
+  return !!resolveRole('fix', severity, env).adapter.supportsWorkflow;
+}
+
+/**
+ * Orchestrator owns PR creation (ADR 0003): ensure the branch is pushed and a
+ * PR exists. Idempotent — createPr returns the existing PR if one is open.
+ */
+async function pushAndCreatePr(worktree, issue) {
+  if (!GITHUB_OWNER || !GITHUB_REPO) return;
+  try {
+    execSync(`git push origin ${worktree.branch}`, { cwd: worktree.dir, stdio: 'pipe' });
+  } catch (err) {
+    console.warn(`[PR] Push failed for ${worktree.branch}: ${err.message}`);
+  }
+  try {
+    const pr = await createPr(
+      GITHUB_OWNER, GITHUB_REPO, worktree.branch,
+      `fix: resolve issue #${issue.number} - ${issue.title}`,
+      `Closes #${issue.number}`,
+    );
+    console.log(`[PR] PR #${pr.number} ready: ${pr.html_url}`);
+  } catch (err) {
+    console.warn(`[PR] Could not create PR for ${worktree.branch}: ${err.message}`);
+  }
+}
+
 /** Squash-merge the branch's PR, rebasing+revalidating on conflict. Returns whether it merged. */
 async function attemptMerge(worktree) {
   const MAX_MERGE_RETRIES = 3;
@@ -131,7 +162,7 @@ async function attemptMerge(worktree) {
   return false;
 }
 
-export async function processIssue(issue, repoPath, dryRun = false) {
+export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd } = {}) {
   const severity = getSeverity(issue);
   console.log(`\n[${'='.repeat(50)}]`);
   console.log(`[ISSUE #${issue.number}] ${issue.title}`);
@@ -155,119 +186,149 @@ export async function processIssue(issue, repoPath, dryRun = false) {
   }
 
   try {
-    // Phase 2: Triage
-    let triageResult;
-    try {
-      console.log(`[TRIAGE] Starting analysis...`);
-      triageResult = await runTriageAgent(issue, worktree.dir);
-      console.log(`[TRIAGE] Done (${(triageResult.duration / 1000).toFixed(1)}s, $${triageResult.cost})`);
-    } catch (err) {
-      console.error(`[TRIAGE FAIL] ${err.error}`);
-      triageResult = null;
-    }
-
-    // Phase 3: Fix
-    let fixResult;
-    try {
-      console.log(`[FIX] Starting fix agent...`);
-      fixResult = await runFixAgent(issue, triageResult?.analysis, worktree.dir);
-      console.log(`[FIX] Done (${(fixResult.duration / 1000).toFixed(1)}s, $${fixResult.cost}, model: ${fixResult.model})`);
-    } catch (err) {
-      console.error(`[FIX FAIL] ${err.error}`);
-      const totalCost = logResult(issue.number, {
-        model: err.model || 'unknown',
-        cost: 0,
-        status: 'fix-failed',
-        duration: err.duration,
-        output: err.error,
-      });
-      return { issue: issue.number, status: 'fix-failed', totalCost };
-    }
-
-    // Phase 3.5: orchestrator owns PR creation (ADR 0003). Ensure the branch is
-    // pushed and a PR exists before the review loop / human handoff.
-    if (GITHUB_OWNER && GITHUB_REPO) {
-      try {
-        execSync(`git push origin ${worktree.branch}`, { cwd: worktree.dir, stdio: 'pipe' });
-      } catch (err) {
-        console.warn(`[PR] Push failed for ${worktree.branch}: ${err.message}`);
-      }
-      try {
-        const pr = await createPr(
-          GITHUB_OWNER, GITHUB_REPO, worktree.branch,
-          `fix: resolve issue #${issue.number} - ${issue.title}`,
-          `Closes #${issue.number}`,
-        );
-        console.log(`[PR] PR #${pr.number} ready: ${pr.html_url}`);
-      } catch (err) {
-        console.warn(`[PR] Could not create PR for ${worktree.branch}: ${err.message}`);
-      }
-    }
-
-    // Phases 4–5: iterative fix → validate → review loop (ADR 0002).
-    const MAX_ITER = Math.max(1, parseInt(process.env.MAX_ITERATIONS || '3', 10) || 3);
+    // The "brain" produces a committed fix and tells us whether it's confirmed.
+    // Two implementations share the same outputs: a Claude dynamic-workflow brain
+    // (triage→fix→adversarial review→converge, all in one headless call) and the
+    // hand-rolled triage→fix→loop (Codex/Kimi, or USE_WORKFLOW off).
     let confirmed = false;
     let blockingAtCap = false;
     let failStage = null;
-    let reviewCost = 0;
-    let reworkCost = 0;
-    let reworkDuration = 0;
+    let brainModel = resolveRole('fix', severity).model;
+    let brainOutput = '';
+    let brainCost = 0;
+    let brainDuration = 0;
 
-    for (let iteration = 1; iteration <= MAX_ITER; iteration++) {
-      console.log(`[LOOP] Iteration ${iteration}/${MAX_ITER}`);
+    if (useWorkflowBrain(severity)) {
+      // Workflow brain. `confirmed` is ADVISORY — we re-validate authoritatively.
+      let wf;
+      try {
+        console.log(`[WORKFLOW] Running fix-issue workflow${budgetUsd ? ` (budget $${budgetUsd.toFixed(2)})` : ''}...`);
+        wf = await runFixWorkflow(issue, worktree, { severity, budgetUsd });
+        brainCost = wf.cost; brainDuration = wf.duration; brainModel = wf.model; brainOutput = wf.summary;
+        console.log(`[WORKFLOW] ${wf.confirmed ? 'confirmed' : 'unconfirmed'} after ${wf.iterations} iteration(s) ($${wf.cost.toFixed(4)})`);
+      } catch (err) {
+        console.error(`[WORKFLOW FAIL] ${err.error || err.message}`);
+        const totalCost = logResult(issue.number, {
+          model: 'unknown', cost: 0, status: 'fix-failed', duration: err.duration, output: err.error,
+        });
+        return { issue: issue.number, status: 'fix-failed', totalCost };
+      }
+
+      await pushAndCreatePr(worktree, issue);
+
+      // Authoritative gate — never trust the workflow's self-report.
       const validation = await validateBranch(worktree.dir);
-
       if (!validation.passed) {
-        console.log(`[VALIDATE] failed at '${validation.stage}' gate: ${validation.error}`);
-        if (loopDecision({ validationPassed: false, blocking: false, iteration, maxIterations: MAX_ITER }) === 'fail-validation') {
-          failStage = validation.stage;
-          break;
+        console.log(`[VALIDATE] authoritative gate failed at '${validation.stage}': ${validation.error}`);
+        failStage = validation.stage;
+      } else if (wf.apiError || !wf.confirmed) {
+        // Fail closed: the workflow errored or couldn't clear its adversarial
+        // review within the caps → hand to a human, never call it confirmed.
+        console.log(`[WORKFLOW] gates pass but fix is not confirmed → flagging for human review.`);
+        blockingAtCap = true;
+      } else {
+        confirmed = true;
+      }
+    } else {
+      // ---- Hand-rolled pipeline (Codex/Kimi, or USE_WORKFLOW off) ----
+      // Phase 2: Triage
+      let triageResult;
+      try {
+        console.log(`[TRIAGE] Starting analysis...`);
+        triageResult = await runTriageAgent(issue, worktree.dir);
+        console.log(`[TRIAGE] Done (${(triageResult.duration / 1000).toFixed(1)}s, $${triageResult.cost})`);
+      } catch (err) {
+        console.error(`[TRIAGE FAIL] ${err.error}`);
+        triageResult = null;
+      }
+
+      // Phase 3: Fix
+      let fixResult;
+      try {
+        console.log(`[FIX] Starting fix agent...`);
+        fixResult = await runFixAgent(issue, triageResult?.analysis, worktree.dir);
+        console.log(`[FIX] Done (${(fixResult.duration / 1000).toFixed(1)}s, $${fixResult.cost}, model: ${fixResult.model})`);
+      } catch (err) {
+        console.error(`[FIX FAIL] ${err.error}`);
+        const totalCost = logResult(issue.number, {
+          model: err.model || 'unknown',
+          cost: 0,
+          status: 'fix-failed',
+          duration: err.duration,
+          output: err.error,
+        });
+        return { issue: issue.number, status: 'fix-failed', totalCost };
+      }
+
+      // Phase 3.5: orchestrator owns PR creation (ADR 0003).
+      await pushAndCreatePr(worktree, issue);
+
+      // Phases 4–5: iterative fix → validate → review loop (ADR 0002).
+      const MAX_ITER = Math.max(1, parseInt(process.env.MAX_ITERATIONS || '3', 10) || 3);
+      let reviewCost = 0;
+      let reworkCost = 0;
+      let reworkDuration = 0;
+
+      for (let iteration = 1; iteration <= MAX_ITER; iteration++) {
+        console.log(`[LOOP] Iteration ${iteration}/${MAX_ITER}`);
+        const validation = await validateBranch(worktree.dir);
+
+        if (!validation.passed) {
+          console.log(`[VALIDATE] failed at '${validation.stage}' gate: ${validation.error}`);
+          if (loopDecision({ validationPassed: false, blocking: false, iteration, maxIterations: MAX_ITER }) === 'fail-validation') {
+            failStage = validation.stage;
+            break;
+          }
+          try {
+            const r = await runReworkAgent(issue, `The fix did not pass the '${validation.stage}' gate:\n${validation.error}\n\nResolve this so the gate passes; keep the change minimal.`, worktree.dir);
+            reworkCost += r.cost;
+            reworkDuration += r.duration;
+            pushBranch(worktree);
+          } catch (err) {
+            console.warn(`[REWORK] failed: ${err.error || err.message}`);
+            failStage = validation.stage;
+            break;
+          }
+          continue;
         }
+        console.log(`[VALIDATE] gates passed`);
+
+        const review = await acquireReview(issue, worktree.dir);
+        reviewCost += review.cost;
+        const decision = loopDecision({ validationPassed: true, blocking: review.blocking, iteration, maxIterations: MAX_ITER });
+        if (decision === 'confirmed') { confirmed = true; break; }
+        if (decision === 'unconfirmed-blocking') { blockingAtCap = true; break; }
+
+        console.log(`[REWORK] Addressing ${review.comments.length} review finding(s)...`);
         try {
-          const r = await runReworkAgent(issue, `The fix did not pass the '${validation.stage}' gate:\n${validation.error}\n\nResolve this so the gate passes; keep the change minimal.`, worktree.dir);
+          const r = await runReworkAgent(issue, formatReviewComments(review.comments), worktree.dir);
           reworkCost += r.cost;
           reworkDuration += r.duration;
           pushBranch(worktree);
         } catch (err) {
           console.warn(`[REWORK] failed: ${err.error || err.message}`);
-          failStage = validation.stage;
+          blockingAtCap = true;
           break;
         }
-        continue;
       }
-      console.log(`[VALIDATE] gates passed`);
 
-      const review = await acquireReview(issue, worktree.dir);
-      reviewCost += review.cost;
-      const decision = loopDecision({ validationPassed: true, blocking: review.blocking, iteration, maxIterations: MAX_ITER });
-      if (decision === 'confirmed') { confirmed = true; break; }
-      if (decision === 'unconfirmed-blocking') { blockingAtCap = true; break; }
-
-      console.log(`[REWORK] Addressing ${review.comments.length} review finding(s)...`);
-      try {
-        const r = await runReworkAgent(issue, formatReviewComments(review.comments), worktree.dir);
-        reworkCost += r.cost;
-        reworkDuration += r.duration;
-        pushBranch(worktree);
-      } catch (err) {
-        console.warn(`[REWORK] failed: ${err.error || err.message}`);
-        blockingAtCap = true;
-        break;
-      }
+      brainModel = fixResult.model;
+      brainOutput = fixResult.output;
+      brainCost = (triageResult?.cost || 0) + (fixResult?.cost || 0) + reviewCost + reworkCost;
+      brainDuration = (triageResult?.duration || 0) + fixResult.duration + reworkDuration;
     }
 
     // Validation never passed within the cap → terminal validation status.
     if (failStage) {
       const failStatus = statusForStage(failStage);
-      const cost = (triageResult?.cost || 0) + (fixResult?.cost || 0) + reviewCost + reworkCost;
       const totalCost = logResult(issue.number, {
-        model: fixResult.model,
-        cost,
+        model: brainModel,
+        cost: brainCost,
         status: failStatus,
-        duration: (triageResult?.duration || 0) + fixResult.duration + reworkDuration,
-        output: fixResult.output,
+        duration: brainDuration,
+        output: brainOutput,
       });
-      return { issue: issue.number, status: failStatus, cost, totalCost };
+      return { issue: issue.number, status: failStatus, cost: brainCost, totalCost };
     }
 
     // Phase 5.5: optional CI gate — only meaningful once the fix is locally
@@ -287,7 +348,15 @@ export async function processIssue(issue, repoPath, dryRun = false) {
           }
         }
       } catch (err) {
-        console.warn(`[CI] Could not evaluate CI checks: ${err.message}. Proceeding without CI gate.`);
+        // Fail closed when we'd otherwise auto-merge: an unevaluable CI check
+        // must not be treated as green. Without auto-merge the PR is left for a
+        // human anyway, so proceeding is safe.
+        if (AUTO_MERGE === 'true') {
+          console.warn(`[CI] Could not evaluate CI checks: ${err.message}. Auto-merge on → blocking merge, flagging for human review.`);
+          ciFailed = true;
+        } else {
+          console.warn(`[CI] Could not evaluate CI checks: ${err.message}. Proceeding without CI gate (no auto-merge).`);
+        }
       }
     }
 
@@ -300,7 +369,7 @@ export async function processIssue(issue, repoPath, dryRun = false) {
       try {
         const pr = await getPrForBranch(GITHUB_OWNER, GITHUB_REPO, worktree.branch);
         if (pr) {
-          const reason = ciFailed ? 'CI checks did not pass' : `blocking review findings remain after ${MAX_ITER} iterations`;
+          const reason = ciFailed ? 'CI checks did not pass' : 'fix not confirmed (blocking review findings remain)';
           console.log(`[HANDOFF] ${reason}. Flagging PR #${pr.number} for human review.`);
           await flagForHumanReview(GITHUB_OWNER, GITHUB_REPO, pr.number);
         }
@@ -325,16 +394,15 @@ export async function processIssue(issue, repoPath, dryRun = false) {
     if (status === 'no-pr') {
       console.warn(`[PR] No pull request found for ${worktree.branch}. Fix is committed/pushed but no PR was opened — flagging as no-pr.`);
     }
-    const cost = (triageResult?.cost || 0) + (fixResult?.cost || 0) + reviewCost + reworkCost;
     const totalCost = logResult(issue.number, {
-      model: fixResult.model,
-      cost,
+      model: brainModel,
+      cost: brainCost,
       status,
-      duration: (triageResult?.duration || 0) + fixResult.duration + reworkDuration,
-      output: fixResult.output,
+      duration: brainDuration,
+      output: brainOutput,
     });
 
-    return { issue: issue.number, status, cost, totalCost };
+    return { issue: issue.number, status, cost: brainCost, totalCost };
 
   } finally {
     // Always clean up the worktree, even on crash
@@ -350,26 +418,45 @@ export async function runQueue(issues, repoPath, concurrency, costCeiling, dryRu
 
   startRun();
 
+  // Per-issue budget reservation prevents concurrent issues from each seeing
+  // spend below the ceiling and collectively overspending. The reserved amount
+  // becomes the workflow path's hard --max-budget-usd cap; for the hand-rolled
+  // path it bounds how many issues run at once. Default slices the ceiling
+  // across the worker pool; override with PER_ISSUE_BUDGET_USD.
+  const effConcurrency = Math.max(1, Math.min(concurrency, queue.length));
+  const perIssueBudget = parseFloat(process.env.PER_ISSUE_BUDGET_USD || '0') || (costCeiling / effConcurrency);
+
   async function next() {
     while (queue.length > 0 && !stopped) {
-      if (getRunCost() >= costCeiling) {
-        console.log(`\n[COST CEILING] Reached $${costCeiling} limit. Stopping.`);
+      if (getCommittedCost() >= costCeiling) {
+        console.log(`\n[COST CEILING] Reached $${costCeiling} limit (committed). Stopping.`);
+        stopped = true;
+        return;
+      }
+
+      // Reserve before starting so in-flight issues can't collectively overspend.
+      const budgetUsd = dryRun ? 0 : Math.min(perIssueBudget, costCeiling - getCommittedCost());
+      if (!dryRun && !reserveBudget(budgetUsd, costCeiling)) {
+        // Not enough headroom to safely start another issue right now.
         stopped = true;
         return;
       }
 
       const issue = queue.shift();
-      const result = await processIssue(issue, repoPath, dryRun);
-      results.push(result);
-
-      if (result.totalCost >= costCeiling) {
-        stopped = true;
+      try {
+        const result = await processIssue(issue, repoPath, dryRun, { budgetUsd });
+        results.push(result);
+        if (getRunCost() >= costCeiling) {
+          stopped = true;
+        }
+      } finally {
+        if (!dryRun) releaseBudget(budgetUsd);
       }
     }
   }
 
   const workers = Array.from(
-    { length: Math.min(concurrency, queue.length) },
+    { length: effConcurrency },
     () => next()
   );
   await Promise.all(workers);

@@ -8,7 +8,7 @@ import { rmSync } from 'node:fs';
 const LOG = join(tmpdir(), `orch-test-log-${process.pid}.json`);
 process.env.RUN_LOG_PATH = LOG;
 
-const { startRun, logResult, getRunCost, getLifetimeCost } = await import('../src/logger.js');
+const { startRun, logResult, getRunCost, getLifetimeCost, reserveBudget, releaseBudget, getCommittedCost } = await import('../src/logger.js');
 
 after(() => { try { rmSync(LOG); } catch {} });
 
@@ -34,4 +34,32 @@ test('logResult returns the current run cost (what the ceiling checks)', () => {
   startRun();
   const after1 = logResult(9, { model: 'opus', cost: 4, status: 'merged', duration: 5, output: '' });
   assert.equal(after1, 4);
+});
+
+// Reservation prevents concurrent issues from each seeing spend below the
+// ceiling and collectively overspending.
+test('reserveBudget blocks starts that would exceed the ceiling; committed = spent + reserved', () => {
+  startRun();
+  assert.equal(getCommittedCost(), 0);
+  assert.equal(reserveBudget(20, 50), true, 'first reservation fits');
+  assert.equal(reserveBudget(20, 50), true, 'second fits (40 <= 50)');
+  assert.equal(getCommittedCost(), 40, 'reservations count toward committed');
+  assert.equal(reserveBudget(20, 50), false, 'third would exceed the ceiling → blocked');
+  assert.equal(getCommittedCost(), 40, 'a blocked reservation does not change committed');
+});
+
+test('releaseBudget frees reserved budget; logged spend then counts as committed', () => {
+  startRun();
+  reserveBudget(20, 50);
+  logResult(1, { model: 'opus', cost: 5, status: 'merged', duration: 1, output: '' });
+  releaseBudget(20);
+  assert.equal(getRunCost(), 5, 'actual spend recorded');
+  assert.equal(getCommittedCost(), 5, 'committed = spent once the reservation is released');
+});
+
+test('startRun resets reservations as well as spend', () => {
+  startRun();
+  reserveBudget(30, 50);
+  startRun();
+  assert.equal(getCommittedCost(), 0, 'a new run clears reservations');
 });
