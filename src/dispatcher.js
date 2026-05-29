@@ -182,7 +182,13 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
     console.log(`[BRANCH] ${worktree.branch}`);
   } catch (err) {
     console.error(`[WORKTREE FAIL] ${err.message}`);
-    return { issue: issue.number, status: 'worktree-failed', error: err.message };
+    // Log it so a worktree/install failure leaves a trace in run-log.json
+    // instead of vanishing (the run otherwise looks like it never started).
+    // createWorktree already tore down any partial worktree/branch.
+    const totalCost = logResult(issue.number, {
+      model: 'unknown', cost: 0, status: 'worktree-failed', duration: 0, output: err.message,
+    });
+    return { issue: issue.number, status: 'worktree-failed', error: err.message, totalCost };
   }
 
   try {

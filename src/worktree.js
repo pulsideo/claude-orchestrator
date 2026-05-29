@@ -38,6 +38,36 @@ export function lockfileFor(pm) {
   return Object.keys(LOCKFILES).find(f => LOCKFILES[f] === pm) || '';
 }
 
+/**
+ * Resolve the bin directory of the Node version the target repo pins
+ * (.nvmrc / mise.toml / .tool-versions / engines.node), via mise. Returns null
+ * when mise isn't installed or the repo pins nothing.
+ *
+ * execSync bypasses mise's shell hook, so without this the worktree's
+ * pnpm/npx/vitest run under whatever Node is first on PATH. When the repo pins a
+ * different major that fails hard at install (ERR_PNPM_UNSUPPORTED_ENGINE) and
+ * the whole issue dies at 'worktree-failed'. We resolve from the (trusted) main
+ * checkout and prepend the result to PATH so every child process picks it up —
+ * no per-worktree `mise trust` needed.
+ */
+export function resolveRepoNodeBin(repoPath, env = process.env) {
+  try {
+    const where = execSync('mise where node', {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env,
+    }).trim();
+    if (where) {
+      const bin = join(where, 'bin');
+      if (existsSync(bin)) return bin;
+    }
+  } catch {
+    // mise absent, or no Node pin for this repo — caller falls back to PATH Node.
+  }
+  return null;
+}
+
 export function createWorktree(repoPath, issueNumber) {
   const worktreeBase = join(repoPath, '..', WORKTREE_DIR_NAME);
   mkdirSync(worktreeBase, { recursive: true });
@@ -68,16 +98,37 @@ export function createWorktree(repoPath, issueNumber) {
     { cwd: repoPath, stdio: 'pipe' }
   );
 
+  try {
+    return setupWorktree(repoPath, dir, branch, issueNumber);
+  } catch (err) {
+    // A post-creation step (almost always `install`) failed. Tear down the
+    // worktree+branch we just created so failed issues don't leak fix/issue-*
+    // branches, then rethrow so the dispatcher can log the failure.
+    try { removeWorktree(repoPath, dir, branch); } catch { /* best effort */ }
+    throw err;
+  }
+}
+
+/** Post-creation setup (deps + env files) for a freshly-added worktree. */
+function setupWorktree(repoPath, dir, branch, issueNumber) {
   // Install deps using the target repo's own package manager (auto-detected,
   // overridable via PACKAGE_MANAGER) instead of assuming pnpm (CRITIQUE #3).
   if (existsSync(join(dir, 'package.json'))) {
     const pm = detectPackageManager(dir);
     console.log(`[WORKTREE] Installing dependencies (${pm}) for issue #${issueNumber}...`);
-    execSync(`${pm} install`, {
-      cwd: dir,
-      stdio: 'pipe',
-      timeout: 180_000,
-    });
+    try {
+      execSync(`${pm} install`, {
+        cwd: dir,
+        stdio: 'pipe',
+        timeout: 180_000,
+      });
+    } catch (err) {
+      // execSync's "Command failed: pnpm install" hides the real cause. Surface
+      // the captured stderr/stdout (e.g. ERR_PNPM_UNSUPPORTED_ENGINE) so the
+      // run log says why instead of just that it failed.
+      const detail = (err.stderr?.toString() || err.stdout?.toString() || '').trim();
+      throw new Error(`${pm} install failed${detail ? `: ${detail.slice(0, 2000)}` : `: ${err.message}`}`, { cause: err });
+    }
 
     // Optionally install extra test deps the worktree needs but the manifest
     // lacks. Restore the tracked manifest/lockfile afterward so these installs

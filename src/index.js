@@ -1,7 +1,8 @@
 import 'dotenv/config';
 import { fetchIssues } from './github.js';
 import { runQueue } from './dispatcher.js';
-import { cleanupAllWorktrees } from './worktree.js';
+import { cleanupAllWorktrees, resolveRepoNodeBin } from './worktree.js';
+import { delimiter } from 'path';
 import { runDiscovery } from './discovery.js';
 import { shouldShowMenu, runMenu } from './menu.js';
 import { workflowOverrideWarning } from './providers.js';
@@ -43,6 +44,17 @@ async function main() {
   // the Claude workflow brain runs (its sub-agents are always Claude).
   const wfWarning = workflowOverrideWarning(process.env);
   if (wfWarning) console.warn(`[WORKFLOW] ${wfWarning}\n`);
+
+  // Run worktree tooling (install, vitest, lint) under the Node version the
+  // target repo pins. execSync bypasses mise's shell hook, so without this a
+  // repo pinning a different Node major fails every fix at 'worktree-failed'
+  // (ERR_PNPM_UNSUPPORTED_ENGINE). Resolve once from the trusted main checkout
+  // and prepend to PATH so all child processes inherit it.
+  const repoNodeBin = resolveRepoNodeBin(REPO_LOCAL_PATH);
+  if (repoNodeBin) {
+    process.env.PATH = `${repoNodeBin}${delimiter}${process.env.PATH}`;
+    console.log(`[INIT] Using repo-pinned Node toolchain: ${repoNodeBin}`);
+  }
 
   // Clean up any leftover worktrees from previous runs
   console.log(`[INIT] Cleaning stale worktrees...`);
