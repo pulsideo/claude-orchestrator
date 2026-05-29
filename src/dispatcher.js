@@ -5,7 +5,7 @@ import { runTriageAgent, runFixAgent, runReworkAgent, runReviewAgent } from './a
 import { resolveRole } from './providers.js';
 import { runFixWorkflow } from './workflow.js';
 import { reviewWithGreptile, getDiff } from './greptile.js';
-import { logResult, getRunCost, startRun, reserveBudget, releaseBudget, getCommittedCost } from './logger.js';
+import { logResult, getRunCost, startRun, reserveBudget, releaseBudget } from './logger.js';
 
 const {
   GITHUB_OWNER,
@@ -434,16 +434,14 @@ export async function runQueue(issues, repoPath, concurrency, costCeiling, dryRu
 
   async function next() {
     while (queue.length > 0 && !stopped) {
-      if (getCommittedCost() >= costCeiling) {
-        console.log(`\n[COST CEILING] Reached $${costCeiling} limit (committed). Stopping.`);
-        stopped = true;
-        return;
-      }
-
-      // Reserve before starting so in-flight issues can't collectively overspend.
-      const budgetUsd = dryRun ? 0 : Math.min(perIssueBudget, costCeiling - getCommittedCost());
+      // Reserve a FULL per-issue budget before starting — never start an issue on
+      // a crumb of leftover headroom. The workflow's --max-budget-usd is
+      // best-effort (the CLI checks it between turns, not mid-turn), so a tiny
+      // cap is effectively ignored and a crumb-start overshoots wildly. Reserving
+      // the full budget makes the ceiling a meaningful token-cost governor.
+      const budgetUsd = dryRun ? 0 : perIssueBudget;
       if (!dryRun && !reserveBudget(budgetUsd, costCeiling)) {
-        // Not enough headroom to safely start another issue right now.
+        console.log(`\n[COST CEILING] $${costCeiling} reached — not enough headroom for another issue ($${perIssueBudget.toFixed(2)}/issue). Not dispatching more; in-flight issues will finish.`);
         stopped = true;
         return;
       }
@@ -452,6 +450,11 @@ export async function runQueue(issues, repoPath, concurrency, costCeiling, dryRu
       try {
         const result = await processIssue(issue, repoPath, dryRun, { budgetUsd });
         results.push(result);
+        // The CLI budget cap is best-effort; surface when an issue blew past it
+        // so the ceiling's softness is visible rather than silent.
+        if (!dryRun && (result.cost || 0) > budgetUsd * 1.1) {
+          console.warn(`[BUDGET] #${issue.number} used $${(result.cost || 0).toFixed(2)} vs its $${budgetUsd.toFixed(2)} cap — --max-budget-usd is best-effort, so the ceiling is soft.`);
+        }
         if (getRunCost() >= costCeiling) {
           stopped = true;
         }

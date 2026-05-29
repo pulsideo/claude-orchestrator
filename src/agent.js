@@ -92,8 +92,14 @@ function runAgentAttempt(opts, dropApiKey) {
  * Scan the target repo for bugs within a free-text scope. Read-only; returns
  * the agent's raw output (a JSON array of proposed bugs) for the caller to parse.
  */
-export function runDiscoveryAgent(scope, repoPath) {
-  const prompt = loadPrompt('discover', { scope: scope || 'the whole codebase' });
+export function runDiscoveryAgent(scope, repoPath, existingTitles = []) {
+  // Give the agent the open-issue titles so it can skip bugs already tracked,
+  // including ones it would phrase differently — the title-only dedup backstop
+  // in discovery.js can't catch semantic duplicates.
+  const existing = existingTitles.length
+    ? existingTitles.map(t => `- ${t}`).join('\n')
+    : '(none)';
+  const prompt = loadPrompt('discover', { scope: scope || 'the whole codebase', existing });
 
   return runAgent({
     role: 'discovery',

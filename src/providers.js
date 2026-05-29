@@ -123,6 +123,20 @@ export function isApiKeyDisabled() {
   return apiKeyDisabled;
 }
 
+/**
+ * What the cost ceiling actually measures, given the active auth. With a live
+ * ANTHROPIC_API_KEY the CLI bills the metered API, so total_cost_usd is real
+ * money. On a subscription login it's NOTIONAL — token count priced at API
+ * rates — since the subscription is flat-rate, not billed per token. Either way
+ * it tracks token volume, NOT remaining weekly subscription usage.
+ */
+export function costModeLabel(env = process.env) {
+  const usingApiKey = !!env.ANTHROPIC_API_KEY && !apiKeyDisabled;
+  return usingApiKey
+    ? 'metered API spend (real USD)'
+    : 'notional token-cost (USD-equiv; subscription is flat-rate, not billed per token, and this does NOT track remaining weekly usage)';
+}
+
 /** Trip the latch (logs once) so the rest of the run uses the subscription. */
 export function disableApiKeyForRun() {
   if (!apiKeyDisabled) {

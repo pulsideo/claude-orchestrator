@@ -5,7 +5,7 @@ import { cleanupAllWorktrees, resolveRepoNodeBin } from './worktree.js';
 import { delimiter } from 'path';
 import { runDiscovery } from './discovery.js';
 import { shouldShowMenu, runMenu } from './menu.js';
-import { workflowOverrideWarning } from './providers.js';
+import { workflowOverrideWarning, costModeLabel } from './providers.js';
 
 const {
   GITHUB_TOKEN,
@@ -37,6 +37,7 @@ async function main() {
   console.log(`\nRepo: ${GITHUB_OWNER}/${GITHUB_REPO}`);
   console.log(`Providers: default=${process.env.DEFAULT_PROVIDER || 'claude'}, fix=${process.env.FIX_PROVIDER || process.env.DEFAULT_PROVIDER || 'claude'}, review=${process.env.REVIEW_PROVIDER || process.env.DEFAULT_PROVIDER || 'claude'}`);
   console.log(`Concurrency: ${concurrency} | Cost ceiling: $${costCeiling} | Max iterations: ${process.env.MAX_ITERATIONS || '3'} | Auto-merge: ${process.env.AUTO_MERGE || 'false'}`);
+  console.log(`Ceiling measures ${costModeLabel(process.env)}.`);
   console.log(`Discovery: ${process.env.DISCOVERY === 'true' ? `on (${process.env.DISCOVERY_SCOPE || 'whole repo'})` : 'off'}`);
   console.log(`Dry run: ${!!DRY_RUN}\n`);
 

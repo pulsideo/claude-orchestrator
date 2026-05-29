@@ -5,6 +5,15 @@ within the given scope. Do NOT fix anything and do NOT edit any files.
 
 {{scope}}
 
+## Already-tracked issues — do NOT re-report these
+
+These bugs already have open issues. Do NOT propose any bug that is the same
+underlying defect as one of these, even if you would word the title differently
+(e.g. "double credit grant on signup" and "new subscription grants AI credits
+twice" are the same bug — skip it).
+
+{{existing}}
+
 ## Task
 
 1. Explore the code within scope — read files and run read-only commands.

@@ -54,14 +54,16 @@ export async function runDiscovery(owner, repo, repoPath, env = process.env) {
   const cap = Math.max(1, parseInt(env.DISCOVERY_MAX || '5', 10) || 5);
 
   console.log(`[DISCOVERY] Scanning ${scope} (cap ${cap})...`);
-  const result = await runDiscoveryAgent(scope, repoPath);
+  // Fetch open-issue titles first so the agent can avoid re-proposing tracked
+  // bugs (semantic dedup); the same list is the title-match dedup backstop.
+  const existing = await fetchOpenIssueTitles(owner, repo);
+  const result = await runDiscoveryAgent(scope, repoPath, existing);
   const proposed = parseProposedBugs(result.output);
   if (proposed.length === 0) {
     console.log('[DISCOVERY] No bugs proposed.');
     return { filed: [], cost: result.cost };
   }
 
-  const existing = await fetchOpenIssueTitles(owner, repo);
   const fresh = dedupeProposed(proposed, existing, cap);
   console.log(`[DISCOVERY] ${proposed.length} proposed, ${fresh.length} new after dedup/cap.`);
 
