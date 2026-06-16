@@ -20,6 +20,23 @@ test('buildWorkflowArgs renders prompts and leaves runtime placeholders for the 
   assert.equal(a.branch, 'fix/issue-7');
 });
 
+// #2: the workflow path must fill {{testCommand}} too (the hand-rolled path does);
+// otherwise its agents are told to run a literal {{testCommand}}.
+test('buildWorkflowArgs resolves {{testCommand}} in fix and rework prompts', () => {
+  const a = buildWorkflowArgs(ISSUE, WT, 'high', {});
+  assert.doesNotMatch(a.fixPrompt, /\{\{testCommand\}\}/);
+  assert.doesNotMatch(a.reworkPrompt, /\{\{testCommand\}\}/);
+  // WT.dir has no package.json/lockfile → falls back to `<pm> test` (npm).
+  assert.match(a.fixPrompt, /npm test/);
+});
+
+// #1: the base branch the workflow reviews against is passed through, so a
+// trunk/master repo's review-diff isn't taken against origin/main.
+test('buildWorkflowArgs passes the base branch (default main, overridable)', () => {
+  assert.equal(buildWorkflowArgs(ISSUE, WT, 'high', {}).baseBranch, 'main');
+  assert.equal(buildWorkflowArgs(ISSUE, WT, 'high', { BASE_BRANCH: 'trunk' }).baseBranch, 'trunk');
+});
+
 test('buildWorkflowArgs picks fix template + models from severity (same as hand-rolled path)', () => {
   const crit = buildWorkflowArgs(ISSUE, WT, 'critical', {});
   assert.equal(crit.models.fix, 'opus');     // critical → strong

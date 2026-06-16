@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { detectPackageManager, addDevCommand, lockfileFor, worktreeEnvFiles, baseBranch, resolveBaseBranch } from '../src/worktree.js';
+import { detectPackageManager, addDevCommand, lockfileFor, worktreeEnvFiles, baseBranch, resolveBaseBranch, isSafeBranchName } from '../src/worktree.js';
 
 function dirWith(lockfile) {
   const d = mkdtempSync(join(tmpdir(), 'orch-pm-'));
@@ -65,6 +65,22 @@ test('resolveBaseBranch: env override wins; falls back to main off a repo', () =
   const d = dirWith(null); // a plain dir, not a git repo
   try { assert.equal(resolveBaseBranch(d, {}), 'main'); }
   finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+// #3: the base branch is interpolated into git commands, so it must be a safe
+// ref name — no shell metacharacters.
+test('isSafeBranchName accepts normal refs, rejects shell-unsafe ones', () => {
+  for (const ok of ['main', 'master', 'trunk', 'release/1.2', 'feature_x', 'v2.0-rc']) {
+    assert.ok(isSafeBranchName(ok), `${ok} should be safe`);
+  }
+  for (const bad of ['main; rm -rf /', 'a b', '$(whoami)', '`id`', '-x', 'a..b', '', 'foo|bar', 42]) {
+    assert.ok(!isSafeBranchName(bad), `${JSON.stringify(bad)} should be rejected`);
+  }
+});
+
+test('baseBranch / resolveBaseBranch reject an unsafe explicit BASE_BRANCH', () => {
+  assert.throws(() => baseBranch({ BASE_BRANCH: 'main; echo pwned' }), /Unsafe base branch/);
+  assert.throws(() => resolveBaseBranch('/nonexistent', { BASE_BRANCH: '$(id)' }), /Unsafe base branch/);
 });
 
 // B2: never copy production secrets into an agent worktree by default.
