@@ -54,10 +54,17 @@ Targets the five gaps from `CRITIQUE1.md`'s successor review plus hygiene items.
   to a human as a distinct `over-budget` status. (The workflow path already has
   `--max-budget-usd`.)
 
-## PR D — Hygiene
+## PR D — Hygiene (done)
 
-- `flagForHumanReview` retry de-dup; optional re-review after rebase; document
-  the tests-present gate's presence≠relevance limit; reconcile README/CONTEXT.
+- `flagForHumanReview` retries label and comment separately and skips the
+  comment when a prior handoff (hidden marker) exists, so retries/re-flags no
+  longer double-post.
+- Documented why `attemptMerge` re-validates but does not re-review after a
+  rebase (D2).
+- Documented the tests-present gate's presence≠relevance limit in CONTEXT.md.
+- Reconciled README/CONTEXT with the runner-aware, fail-closed gates and the new
+  terminal statuses (`no-changes`, `over-budget`, and the broadened
+  `needs-human-review`).
 
 ## Sequencing
 

@@ -10,7 +10,7 @@ Automatically fixes GitHub issues using Claude Code agents, prioritized from hig
 3. For each issue, creates an isolated git worktree on a `fix/issue-{number}` branch
 4. Runs a **triage agent** (fast tier) to analyze the root cause
 5. Runs a **fix agent** (strong tier for critical/high, fast for medium/low) to implement the fix, commit and push; the **orchestrator** then opens the PR
-6. Runs an **iterative fix→review loop** (up to `MAX_ITERATIONS`): validate ordered gates — **tests present** (a code change must add/modify a test, unless `REQUIRE_TESTS=false`) → **related tests pass** → **lint passes** — then **review** (Greptile or the reviewer provider). On any failing gate or blocking finding it reworks the fix and repeats; the fix is *confirmed* when gates pass and review has no blocking findings
+6. Runs an **iterative fix→review loop** (up to `MAX_ITERATIONS`): validate ordered gates — **changed something** → **production code changed** → **tests present** (a code change must add/modify a test, unless `REQUIRE_TESTS=false`) → **related tests pass** → **lint passes** — then **review** (Greptile or the reviewer provider). On any failing gate or blocking finding it reworks the fix and repeats; the fix is *confirmed* when gates pass and review has no blocking findings. The test gate is runner-aware (vitest/jest related-tests, else the repo's `test` script; `TEST_COMMAND` overrides) and **fails closed**: a fix it can't validate — no production code changed, a reviewer that errored, or tests that won't run on a clean main — is handed to a human, never confirmed
 7. Optionally waits for **CI** to go green on the PR (`WAIT_FOR_CI=true`); unconfirmed fixes at the cap leave the PR flagged `needs-human-review`
 8. By default **leaves the open PR for a human to merge** (`AUTO_MERGE=false`). Set `AUTO_MERGE=true` to squash-merge confirmed PRs automatically and delete the branch
 9. Verifies a PR actually exists; a pushed fix with no PR is reported as `no-pr`, never `success`
@@ -105,7 +105,7 @@ and the cost ceiling, and to check provider readiness. Headless runs (no TTY,
 - `run-log.json` accumulates every issue across all runs (cost, duration, status, output snippet) plus a `lifetimeCost`; the cost ceiling is checked against the **current run's** spend, not the lifetime total
 - Fix branches are pushed as `fix/issue-{number}` to your repo
 
-Terminal statuses per issue: `merged`, `success` (PR open, pending human review), `no-pr` (fix pushed but no PR found), `needs-human-review` (refinement reverted), `tests-missing` (fix changed code but added no test), `lint-failed`, `ci-failed`, `fix-tests-failed`, `fix-failed`, `worktree-failed`.
+Terminal statuses per issue: `merged`, `success` (PR open, pending human review), `no-pr` (fix pushed but no PR found), `needs-human-review` (couldn't be confirmed — blocking review findings, a reviewer that errored, tests that couldn't be validated, or a fix that changed no production code), `over-budget` (per-issue budget exhausted before confirmation), `no-changes` (fix produced no diff), `tests-missing` (fix changed code but added no test), `lint-failed`, `ci-failed`, `fix-tests-failed`, `fix-failed`, `worktree-failed`.
 
 ## Customizing Prompts
 

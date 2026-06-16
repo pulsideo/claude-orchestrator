@@ -415,28 +415,39 @@ export async function createPr(owner, repo, branch, title, body, base = 'main') 
   return data;
 }
 
+// Hidden marker on the handoff comment so we can detect (and not duplicate) it.
+const REVIEW_MARKER = '<!-- orchestrator:needs-human-review -->';
+
 /**
  * Add a "needs-human-review" label and a comment explaining why. `reason`
  * carries the real cause (A4) — the old hardcoded "refinement broke tests"
  * message was wrong for the CI-failed / blocking-review / unvalidated cases.
+ *
+ * Label and comment are retried separately (D1): the old code wrapped both in
+ * one Promise.all, so a transient comment failure re-ran addLabels AND
+ * re-posted the comment. addLabels is idempotent; the comment is not, so it's
+ * skipped when a prior handoff comment (marker) already exists.
  */
 export async function flagForHumanReview(owner, repo, prNumber, reason = 'this fix could not be automatically confirmed') {
   await withRetry(
-    () => Promise.all([
-      octokit.issues.addLabels({
-        owner,
-        repo,
-        issue_number: prNumber,
-        labels: ['needs-human-review'],
-      }),
-      octokit.issues.createComment({
-        owner,
-        repo,
-        issue_number: prNumber,
-        body: `⚠️ **Needs human review.** Auto-merge was skipped because ${reason}. Please review before merging.`,
-      }),
-    ]),
-    `flagForHumanReview(#${prNumber})`,
+    () => octokit.issues.addLabels({ owner, repo, issue_number: prNumber, labels: ['needs-human-review'] }),
+    `flagForHumanReview.label(#${prNumber})`,
+  );
+
+  const existing = await withRetry(
+    () => octokit.paginate(octokit.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 }),
+    `flagForHumanReview.list(#${prNumber})`,
+  );
+  if (existing.some(c => c.body?.includes(REVIEW_MARKER))) return;
+
+  await withRetry(
+    () => octokit.issues.createComment({
+      owner,
+      repo,
+      issue_number: prNumber,
+      body: `${REVIEW_MARKER}\n⚠️ **Needs human review.** Auto-merge was skipped because ${reason}. Please review before merging.`,
+    }),
+    `flagForHumanReview.comment(#${prNumber})`,
   );
 }
 

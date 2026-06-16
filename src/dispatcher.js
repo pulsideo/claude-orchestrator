@@ -174,6 +174,12 @@ async function attemptMerge(worktree) {
           execSync('git fetch origin main', { cwd: worktree.dir, stdio: 'pipe' });
           execSync('git rebase origin/main', { cwd: worktree.dir, stdio: 'pipe' });
           execSync(`git push origin ${worktree.branch} --force-with-lease`, { cwd: worktree.dir, stdio: 'pipe' });
+          // We re-validate (tests/lint) after the rebase but deliberately do NOT
+          // re-run review (D2): a rebase that merely catches up to main rarely
+          // changes the fix's own diff, and re-review on every merge attempt is
+          // costly. The tests/lint re-run still catches functional regressions
+          // the rebase introduced. If a rebase resolves real conflicts in the
+          // fix itself, prefer AUTO_MERGE=false so a human reviews the result.
           const postRebase = await validateBranch(worktree.dir);
           if (!postRebase.passed) {
             console.warn(`[MERGE] Validation failed after rebase: ${postRebase.error}`);

@@ -85,9 +85,17 @@ _Avoid_: done, verified, approved
 
 **Validation gate**:
 An ordered pass/fail check a fix must clear before it can be Confirmed:
-tests-present (a code change must add/modify a test) → tests-pass → lint →
-optional CI. The first failing gate names the issue's terminal status
-(`tests-missing`, `fix-tests-failed`, `lint-failed`, `ci-failed`).
+changed-something → production-code-changed → tests-present (a code change must
+add/modify a test) → tests-pass → lint → optional CI. The first failing gate
+names the issue's terminal status. Hard fails: `no-changes` (empty diff),
+`tests-missing`, `fix-tests-failed`, `lint-failed`, `ci-failed`. The gate fails
+**closed**: a fix it cannot validate — no production code changed
+(`no-code-change`), or tests that won't run on either the fix branch or a clean
+main (`tests-unvalidated`) — is handed to a human, never silently passed. The
+tests-pass gate is runner-aware (vitest/jest related-tests, else the repo's
+`test` script; `TEST_COMMAND` overrides). Note: tests-present checks a test was
+*added/modified*, not that it actually exercises the fix — presence, not
+relevance.
 _Avoid_: check, validation step
 
 **Settings menu**:
