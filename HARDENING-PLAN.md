@@ -30,12 +30,17 @@ Targets the five gaps from `CRITIQUE1.md`'s successor review plus hygiene items.
 
 ## PR B — Isolation & secret safety
 
-- **B1. Serialize shared-repo git plumbing** — `src/worktree.js`. An in-process
-  per-repo async mutex around `fetch`/`prune`/`branch -D`/`worktree add`; the
-  agent run stays parallel.
-- **B2. Stop leaking secrets** — `src/worktree.js`. Allowlist env files
-  (default `.env.test` only; drop `.env.production`); add copied files to the
-  worktree's `.git/info/exclude` so they can't be committed.
+- **B1. ~~Serialize shared-repo git plumbing~~ — NOT NEEDED.** On inspection
+  `createWorktree`/`removeWorktree` are fully synchronous (`execSync`, no
+  `await`/`spawn`) and the dispatcher calls them synchronously, so Node's single
+  thread already serializes every git command against the shared repo — two
+  workers cannot interleave. The original review overstated this as a race. The
+  one residual edge (background `gc --auto` holding a lock) is rare; harden with
+  `gc.auto=0` only if it ever surfaces. No mutex added.
+- **B2. Stop leaking secrets** — `src/worktree.js` (done). `worktreeEnvFiles()`
+  copies `.env.test` only by default (never `.env.production`), overridable via
+  `WORKTREE_ENV_FILES`; copied files are appended to the worktree's git exclude
+  so `git add -A` can't sweep them into the PR diff.
 
 ## PR C — Cost integrity
 

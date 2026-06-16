@@ -1,6 +1,6 @@
 import { execSync } from 'child_process';
-import { existsSync, rmSync, copyFileSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { existsSync, rmSync, copyFileSync, mkdirSync, readFileSync, appendFileSync } from 'fs';
+import { join, isAbsolute } from 'path';
 
 const WORKTREE_DIR_NAME = '.claude-worktrees';
 
@@ -23,6 +23,39 @@ export function detectPackageManager(dir, env = process.env) {
     if (existsSync(join(dir, lockfile))) return pm;
   }
   return 'npm';
+}
+
+/**
+ * Env files to copy into a worktree (B2). Defaults to `.env.test` ONLY — never
+ * `.env`/`.env.production` — so target-repo production secrets aren't exposed to
+ * an autonomous agent (which runs with Bash) or swept into the PR diff. The old
+ * code copied .env/.env.local/.env.development/.env.production unconditionally.
+ * Override with WORKTREE_ENV_FILES (comma/space separated); empty disables copy.
+ */
+export function worktreeEnvFiles(env = process.env) {
+  if (env.WORKTREE_ENV_FILES === undefined) return ['.env.test'];
+  return env.WORKTREE_ENV_FILES.split(/[\s,]+/).filter(Boolean);
+}
+
+/**
+ * Append paths to the worktree's git exclude so a copied secret can't be swept
+ * into the fix commit by `git add -A` (B2). Idempotent and best-effort — exclude
+ * is advisory, the real protection is not copying secrets in the first place.
+ */
+function excludeFromGit(dir, paths) {
+  try {
+    const rel = execSync('git rev-parse --git-path info/exclude', { cwd: dir, encoding: 'utf-8' }).trim();
+    const file = isAbsolute(rel) ? rel : join(dir, rel);
+    const existing = existsSync(file) ? readFileSync(file, 'utf-8') : '';
+    const have = new Set(existing.split('\n').map(l => l.trim()));
+    const additions = paths.filter(p => !have.has(p));
+    if (additions.length === 0) return;
+    const lead = existing && !existing.endsWith('\n') ? '\n' : '';
+    appendFileSync(file, `${lead}${additions.join('\n')}\n`);
+  } catch {
+    // No git dir / unwritable exclude — fall back to the not-copying-secrets
+    // protection above. Best effort.
+  }
 }
 
 /** The dev-dependency add command for a given package manager. */
@@ -197,14 +230,18 @@ function setupWorktree(repoPath, dir, branch, issueNumber) {
     }
   }
 
-  // Copy env files that aren't tracked by git
-  const envFiles = ['.env', '.env.local', '.env.test', '.env.development', '.env.production'];
-  for (const f of envFiles) {
+  // Copy untracked env files the worktree needs to run tests. Default is
+  // .env.test only — production secrets are NOT copied into an agent's reach
+  // (B2). Copied files are excluded from git so they can't land in the PR diff.
+  const copied = [];
+  for (const f of worktreeEnvFiles()) {
     const src = join(repoPath, f);
     if (existsSync(src)) {
       copyFileSync(src, join(dir, f));
+      copied.push(f);
     }
   }
+  if (copied.length) excludeFromGit(dir, copied);
 
   return { dir, branch };
 }

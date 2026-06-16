@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWorktree, removeWorktree } from '../src/worktree.js';
@@ -47,4 +47,24 @@ test('removeWorktree deletes the local fix branch', () => {
   // After cleanup the branch must be gone, not just the worktree.
   assert.equal(git(`branch --list ${branch}`, repo), '',
     'branch should be deleted after removeWorktree');
+});
+
+// B2: only the test env file is copied (no production secrets), and a copied
+// secret is git-excluded so `git add -A` can't sweep it into the PR diff.
+test('worktree copies .env.test only and git-excludes it', () => {
+  writeFileSync(join(repo, '.env.test'), 'TEST_SECRET=1\n');
+  writeFileSync(join(repo, '.env.production'), 'PROD_SECRET=1\n');
+
+  const { dir, branch } = createWorktree(repo, 4243);
+  try {
+    assert.ok(existsSync(join(dir, '.env.test')), '.env.test should be copied');
+    assert.ok(!existsSync(join(dir, '.env.production')), '.env.production must NOT be copied');
+    // git-excluded → a copied secret does not appear as an untracked change.
+    assert.ok(!git('status --porcelain', dir).includes('.env.test'),
+      '.env.test should be git-excluded in the worktree');
+  } finally {
+    removeWorktree(repo, dir, branch);
+    rmSync(join(repo, '.env.test'), { force: true });
+    rmSync(join(repo, '.env.production'), { force: true });
+  }
 });

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { detectPackageManager, addDevCommand, lockfileFor } from '../src/worktree.js';
+import { detectPackageManager, addDevCommand, lockfileFor, worktreeEnvFiles } from '../src/worktree.js';
 
 function dirWith(lockfile) {
   const d = mkdtempSync(join(tmpdir(), 'orch-pm-'));
@@ -47,4 +47,12 @@ test('addDevCommand builds the right dev-install per manager', () => {
 test('lockfileFor maps manager back to its lockfile for restore', () => {
   assert.equal(lockfileFor('pnpm'), 'pnpm-lock.yaml');
   assert.equal(lockfileFor('npm'), 'package-lock.json');
+});
+
+// B2: never copy production secrets into an agent worktree by default.
+test('worktreeEnvFiles: defaults to .env.test only, overridable, disablable', () => {
+  assert.deepEqual(worktreeEnvFiles({}), ['.env.test']);
+  assert.deepEqual(worktreeEnvFiles({ WORKTREE_ENV_FILES: '.env .env.local' }), ['.env', '.env.local']);
+  assert.deepEqual(worktreeEnvFiles({ WORKTREE_ENV_FILES: '.env,.env.test' }), ['.env', '.env.test']);
+  assert.deepEqual(worktreeEnvFiles({ WORKTREE_ENV_FILES: '' }), []); // explicit empty disables copy
 });
