@@ -154,35 +154,85 @@ export function isVitestReport(output) {
 }
 
 /**
- * Run vitest once and classify the outcome:
- *   ran=true  → it produced a JSON report (tests executed; `failures` lists them)
- *   ran=false → it crashed before running them (module resolution / config
- *               error). `detail` carries the combined stdout+stderr.
+ * Decide how to run tests for a checkout (A1). vitest and jest get related-test
+ * selection (fast, scoped to the fix's files) and emit a parseable JSON report;
+ * any other repo with a `test` script falls back to running the whole suite and
+ * classifying by exit code (`parse:false`). `TEST_COMMAND` overrides everything.
+ * Returns null when no runner can be determined — the caller fails CLOSED rather
+ * than skipping the gate (the old code's silent pass was the bug). Pure.
+ */
+export function detectTestRunner(dir, env = process.env) {
+  if (env.TEST_COMMAND) return { kind: 'custom', parse: false };
+  let pkg;
+  try { pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf-8')); }
+  catch { return null; }
+  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+  if (deps.vitest) return { kind: 'vitest', parse: true };
+  if (deps.jest) return { kind: 'jest', parse: true };
+  if (pkg.scripts?.test) return { kind: 'script', parse: false };
+  return null;
+}
+
+/** Build the test command for a detected runner. `parse` flags JSON output. */
+function planTests(runner, dir, codeFiles, env) {
+  const quoted = codeFiles.map(f => `'${f.replace(/'/g, "'\\''")}'`).join(' ');
+  switch (runner.kind) {
+    case 'vitest': return { parse: true, cmd: `npx vitest related ${quoted} --reporter=json` };
+    case 'jest': return { parse: true, cmd: `npx jest --findRelatedTests ${quoted} --json` };
+    case 'custom': return { parse: false, cmd: env.TEST_COMMAND };
+    default: return { parse: false, cmd: `${detectPackageManager(dir, env)} test` };
+  }
+}
+
+/**
+ * Run one test command and classify the outcome as 'pass' | 'fail' | 'error':
+ *   parse:true  (vitest/jest JSON) — a report with no failures → pass; a report
+ *               with failures → fail (`failures` lists them); NO report → error
+ *               (crashed before running: module resolution / config).
+ *   parse:false (whole-suite script) — exit 0 → pass; non-zero → fail. A script
+ *               can't distinguish a crash from a real failure, so there is no
+ *               'error' outcome; the origin/main comparison handles attribution.
  * Distinguishing a crash from "no failures" matters: parseFailedTests returns []
  * for both, so a crash that printed non-JSON would otherwise look like a pass.
  */
-function runVitest(worktreeDir, vitestCmd) {
+function runTestSuite(worktreeDir, plan) {
   let output;
   let threw = false;
   let detail = '';
   try {
-    output = execSync(vitestCmd, { cwd: worktreeDir, stdio: 'pipe', timeout: 120_000 }).toString();
+    output = execSync(plan.cmd, { cwd: worktreeDir, stdio: 'pipe', timeout: 120_000 }).toString();
   } catch (err) {
     threw = true;
     output = err.stdout?.toString() || '';
     detail = [output, err.stderr?.toString()].filter(Boolean).join('\n').trim().slice(0, 2000) || err.message;
   }
-  if (isVitestReport(output)) return { ran: true, failures: parseFailedTests(output) };
-  if (!threw) return { ran: true, failures: [] }; // exited 0 without a report (defensive)
-  return { ran: false, failures: [], detail };
+  if (plan.parse) {
+    if (isVitestReport(output)) {
+      const failures = parseFailedTests(output);
+      return { outcome: failures.length ? 'fail' : 'pass', failures, detail };
+    }
+    if (!threw) return { outcome: 'pass', failures: [], detail }; // exited 0, no report (defensive)
+    return { outcome: 'error', failures: [], detail };
+  }
+  return { outcome: threw ? 'fail' : 'pass', failures: [], detail };
 }
 
-function runRelatedTests(worktreeDir, codeFiles) {
-  const quotedFiles = codeFiles.map(f => `'${f.replace(/'/g, "'\\''")}'`).join(' ');
-  const vitestCmd = `npx vitest related ${quotedFiles} --reporter=json`;
+/**
+ * Run the fix's related tests and decide whether the fix breaks them, comparing
+ * against origin/main so pre-existing failures aren't blamed on the fix (A1).
+ * FAILS CLOSED: when tests can't be validated at all (no runner, or they crash
+ * on both the branch and a clean main), returns `{ passed:false, unvalidated:true }`
+ * so the caller hands the PR to a human instead of silently passing the gate.
+ */
+function runRelatedTests(worktreeDir, codeFiles, env = process.env) {
+  const runner = detectTestRunner(worktreeDir, env);
+  if (!runner) {
+    return { passed: false, unvalidated: true, error: 'No test runner detected (no vitest/jest dep and no `test` script) — cannot validate the fix.' };
+  }
+  const plan = planTests(runner, worktreeDir, codeFiles, env);
 
-  const fix = runVitest(worktreeDir, vitestCmd);
-  if (fix.ran && fix.failures.length === 0) return { passed: true };
+  const fix = runTestSuite(worktreeDir, plan);
+  if (fix.outcome === 'pass') return { passed: true };
 
   // Re-run on origin/main so we only block on regressions the fix introduced —
   // not pre-existing failures, nor environmental crashes (e.g. an unbuilt
@@ -191,28 +241,38 @@ function runRelatedTests(worktreeDir, codeFiles) {
   let base;
   try {
     execSync('git checkout origin/main --quiet', { cwd: worktreeDir, stdio: 'pipe' });
-    base = runVitest(worktreeDir, vitestCmd);
+    base = runTestSuite(worktreeDir, plan);
   } finally {
     execSync(`git checkout ${currentBranch} --quiet`, { cwd: worktreeDir, stdio: 'pipe' });
   }
 
-  if (!fix.ran) {
-    // Vitest couldn't run the related tests on the branch at all.
-    if (!base.ran) {
-      // Same on a clean main → environmental/pre-existing, not the fix. Don't
-      // blame the fix, but make it loud: the test gate did not validate it.
-      console.warn(`[VALIDATE] vitest could not run the related tests on either the fix branch or origin/main — environmental, skipping the test gate.\n${fix.detail}`);
-      return { passed: true };
+  if (fix.outcome === 'error') {
+    // Tests couldn't run on the branch at all.
+    if (base.outcome === 'error') {
+      // Same on a clean main → environmental. We did NOT validate the fix, so
+      // (unlike the old code) we do NOT pass the gate — hand it to a human.
+      console.warn(`[VALIDATE] tests could not run on either the fix branch or origin/main — unable to validate; handing to human review.\n${fix.detail}`);
+      return { passed: false, unvalidated: true, error: `Tests could not run on the fix branch or a clean origin/main:\n${fix.detail}` };
     }
     // Tests run on main but crash on the branch → the fix broke the run itself.
-    return { passed: false, error: `The fix prevents vitest from running the related tests:\n${fix.detail}` };
+    return { passed: false, error: `The fix prevents the related tests from running:\n${fix.detail}` };
   }
 
-  // Both produced reports — block only on tests the fix newly broke.
-  const baseFailureSet = new Set(base.ran ? base.failures : []);
-  const newFailures = fix.failures.filter(t => !baseFailureSet.has(t));
-  if (newFailures.length === 0) return { passed: true };
-  return { passed: false, error: `New test failures: ${newFailures.join(', ')}` };
+  // Both ran. For JSON runners, block only on tests the fix newly broke.
+  if (plan.parse) {
+    const baseFailureSet = new Set(base.outcome === 'error' ? [] : base.failures);
+    const newFailures = fix.failures.filter(t => !baseFailureSet.has(t));
+    if (newFailures.length === 0) return { passed: true };
+    return { passed: false, error: `New test failures: ${newFailures.join(', ')}` };
+  }
+
+  // Whole-suite script: fix failed. Blame it only if main was green; if main is
+  // also red we can't attribute the failure, so fail closed to human review.
+  if (base.outcome === 'pass') {
+    return { passed: false, error: `The fix's test suite fails (clean on origin/main):\n${fix.detail}` };
+  }
+  console.warn(`[VALIDATE] the test suite fails on both the fix branch and origin/main — pre-existing breakage, unable to validate the fix.`);
+  return { passed: false, unvalidated: true, error: `Test suite fails on both the fix branch and a clean origin/main; cannot attribute to the fix.` };
 }
 
 function lintOnce(cmd, worktreeDir) {
@@ -248,9 +308,10 @@ function runLintGate(worktreeDir, env) {
 /**
  * Validate a fix branch through ordered gates. Returns the failing `stage` so
  * the caller can report a precise status:
- *   tests-missing → code changed but no test added/modified
- *   tests         → new test failures introduced by the fix
- *   lint          → new lint errors introduced by the fix
+ *   tests-missing     → code changed but no test added/modified
+ *   tests             → new test failures introduced by the fix
+ *   tests-unvalidated → tests could not be run/validated (fails closed → human)
+ *   lint              → new lint errors introduced by the fix
  */
 export async function validateBranch(worktreeDir, env = process.env) {
   try {
@@ -267,9 +328,20 @@ export async function validateBranch(worktreeDir, env = process.env) {
       };
     }
 
-    // Gate: related tests must pass (no new failures).
-    const testResult = runRelatedTests(worktreeDir, code);
-    if (!testResult.passed) return { passed: false, stage: 'tests', error: testResult.error };
+    // Gate: related tests must pass (no new failures). A result we couldn't
+    // validate (no runner, or crashes on both branches) is surfaced as a
+    // distinct 'tests-unvalidated' stage so the caller hands it to a human
+    // rather than reworking (rework can't fix an environmental gap) or, worse,
+    // calling it confirmed (A1).
+    const testResult = runRelatedTests(worktreeDir, code, env);
+    if (!testResult.passed) {
+      return {
+        passed: false,
+        stage: testResult.unvalidated ? 'tests-unvalidated' : 'tests',
+        unvalidated: !!testResult.unvalidated,
+        error: testResult.error,
+      };
+    }
 
     // Gate: linter must pass (no new errors).
     const lintResult = runLintGate(worktreeDir, env);
@@ -325,9 +397,11 @@ export async function createPr(owner, repo, branch, title, body, base = 'main') 
 }
 
 /**
- * Add a "needs-human-review" label and a comment explaining why.
+ * Add a "needs-human-review" label and a comment explaining why. `reason`
+ * carries the real cause (A4) — the old hardcoded "refinement broke tests"
+ * message was wrong for the CI-failed / blocking-review / unvalidated cases.
  */
-export async function flagForHumanReview(owner, repo, prNumber) {
+export async function flagForHumanReview(owner, repo, prNumber, reason = 'this fix could not be automatically confirmed') {
   await withRetry(
     () => Promise.all([
       octokit.issues.addLabels({
@@ -340,7 +414,7 @@ export async function flagForHumanReview(owner, repo, prNumber) {
         owner,
         repo,
         issue_number: prNumber,
-        body: '⚠️ **Auto-merge skipped.** The refinement agent\'s changes broke tests and were reverted. The original fix is intact and passing, but this PR needs a human review before merging.',
+        body: `⚠️ **Needs human review.** Auto-merge was skipped because ${reason}. Please review before merging.`,
       }),
     ]),
     `flagForHumanReview(#${prNumber})`,

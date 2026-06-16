@@ -33,6 +33,11 @@ test('statusForStage maps validation stages to terminal statuses', () => {
   assert.equal(statusForStage('something-unknown'), 'fix-tests-failed');
 });
 
+// A1: tests we couldn't validate are a human handoff, not a hard fail.
+test('statusForStage maps tests-unvalidated to needs-human-review', () => {
+  assert.equal(statusForStage('tests-unvalidated'), 'needs-human-review');
+});
+
 // --- fix→review loop decisions (ADR 0002) ---------------------------------
 
 test('loopDecision: failed gates rework while iterations remain, else fail', () => {

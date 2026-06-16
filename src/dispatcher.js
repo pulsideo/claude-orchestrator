@@ -17,6 +17,9 @@ const {
 const VALIDATION_STATUS = {
   'tests-missing': 'tests-missing',
   tests: 'fix-tests-failed',
+  // Tests we couldn't validate are a human handoff, not a hard fail — routed via
+  // the needs-human-review path, but mapped here too as a safety net (A1).
+  'tests-unvalidated': 'needs-human-review',
   lint: 'lint-failed',
   ci: 'ci-failed',
   error: 'validation-error',
@@ -199,6 +202,9 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
     let confirmed = false;
     let blockingAtCap = false;
     let failStage = null;
+    // Human-handoff reason, surfaced on the PR when we flag it (A4). Overridden
+    // when the cause is something other than blocking review findings.
+    let handoffReason = 'fix not confirmed (blocking review findings remain)';
     let brainModel = resolveRole('fix', severity).model;
     let brainOutput = '';
     let brainCost = 0;
@@ -224,7 +230,12 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
 
       // Authoritative gate — never trust the workflow's self-report.
       const validation = await validateBranch(worktree.dir);
-      if (!validation.passed) {
+      if (validation.unvalidated) {
+        // Couldn't validate the tests → hand to a human, never confirm (A1).
+        console.log(`[VALIDATE] tests unvalidated: ${validation.error}`);
+        handoffReason = 'tests could not be validated (no runner, or they crash on a clean main)';
+        blockingAtCap = true;
+      } else if (!validation.passed) {
         console.log(`[VALIDATE] authoritative gate failed at '${validation.stage}': ${validation.error}`);
         failStage = validation.stage;
       } else if (wf.apiError || !wf.confirmed) {
@@ -279,6 +290,15 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
         console.log(`[LOOP] Iteration ${iteration}/${MAX_ITER}`);
         const validation = await validateBranch(worktree.dir);
 
+        if (validation.unvalidated) {
+          // The test gate couldn't validate the fix (no runner, or it crashes on
+          // a clean main too). Reworking can't fix an environmental gap, so hand
+          // straight to a human instead of burning iterations (A1).
+          console.log(`[VALIDATE] tests unvalidated: ${validation.error}`);
+          handoffReason = 'tests could not be validated (no runner, or they crash on a clean main)';
+          blockingAtCap = true;
+          break;
+        }
         if (!validation.passed) {
           console.log(`[VALIDATE] failed at '${validation.stage}' gate: ${validation.error}`);
           if (loopDecision({ validationPassed: false, blocking: false, iteration, maxIterations: MAX_ITER }) === 'fail-validation') {
@@ -375,9 +395,9 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
       try {
         const pr = await getPrForBranch(GITHUB_OWNER, GITHUB_REPO, worktree.branch);
         if (pr) {
-          const reason = ciFailed ? 'CI checks did not pass' : 'fix not confirmed (blocking review findings remain)';
+          const reason = ciFailed ? 'CI checks did not pass' : handoffReason;
           console.log(`[HANDOFF] ${reason}. Flagging PR #${pr.number} for human review.`);
-          await flagForHumanReview(GITHUB_OWNER, GITHUB_REPO, pr.number);
+          await flagForHumanReview(GITHUB_OWNER, GITHUB_REPO, pr.number, reason);
         }
       } catch (err) {
         console.warn(`[HANDOFF] Failed to flag PR for review: ${err.message}`);

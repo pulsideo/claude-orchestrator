@@ -8,6 +8,7 @@ import {
   classifyChangedFiles,
   requireTests,
   detectLintCommand,
+  detectTestRunner,
   summarizeChecks,
 } from '../src/github.js';
 
@@ -48,6 +49,35 @@ test('detectLintCommand: env override > lint script > none', () => {
     // no lint script → null
     writeFileSync(join(d, 'package.json'), JSON.stringify({ scripts: { build: 'tsc' } }));
     assert.equal(detectLintCommand(d, {}), null);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('detectTestRunner: vitest/jest get JSON related-tests, script falls back, none = null (A1)', () => {
+  const d = mkdtempSync(join(tmpdir(), 'orch-runner-'));
+  try {
+    // TEST_COMMAND overrides everything, even with no package.json
+    assert.deepEqual(detectTestRunner(d, { TEST_COMMAND: 'make test' }), { kind: 'custom', parse: false });
+
+    // no package.json → null (fail closed, caller hands to human)
+    assert.equal(detectTestRunner(d, {}), null);
+
+    // vitest dep → parseable JSON runner
+    writeFileSync(join(d, 'package.json'), JSON.stringify({ devDependencies: { vitest: '^1' } }));
+    assert.deepEqual(detectTestRunner(d, {}), { kind: 'vitest', parse: true });
+
+    // jest dep → parseable JSON runner
+    writeFileSync(join(d, 'package.json'), JSON.stringify({ dependencies: { jest: '^29' } }));
+    assert.deepEqual(detectTestRunner(d, {}), { kind: 'jest', parse: true });
+
+    // no known runner but a test script → whole-suite, exit-code mode
+    writeFileSync(join(d, 'package.json'), JSON.stringify({ scripts: { test: 'mocha' } }));
+    assert.deepEqual(detectTestRunner(d, {}), { kind: 'script', parse: false });
+
+    // a package.json with neither a known runner nor a test script → null
+    writeFileSync(join(d, 'package.json'), JSON.stringify({ scripts: { build: 'tsc' } }));
+    assert.equal(detectTestRunner(d, {}), null);
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
