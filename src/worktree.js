@@ -26,6 +26,38 @@ export function detectPackageManager(dir, env = process.env) {
 }
 
 /**
+ * The repo's default/base branch — the branch fixes are cut from, validated
+ * against, and merged into (#5). Reads the value index.js resolved once via
+ * resolveBaseBranch; falls back to 'main' so nothing hardcodes it. Pure.
+ */
+export function baseBranch(env = process.env) {
+  return env.BASE_BRANCH || 'main';
+}
+
+/**
+ * Resolve the target repo's default branch ONCE at startup: BASE_BRANCH wins;
+ * else the remote's published default (origin/HEAD) — set by `git clone` or
+ * `git remote set-head origin -a`; else 'main'. index.js stores the result in
+ * BASE_BRANCH so every later baseBranch() call is a cheap env read, and a repo
+ * on master/trunk/etc. is no longer assumed to use 'main'.
+ */
+export function resolveBaseBranch(repoPath, env = process.env) {
+  if (env.BASE_BRANCH) return env.BASE_BRANCH;
+  try {
+    const ref = execSync('git symbolic-ref --short refs/remotes/origin/HEAD', {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const name = ref.replace(/^origin\//, '');
+    if (name) return name;
+  } catch {
+    // origin/HEAD not set (some clones don't record it) — fall back to 'main'.
+  }
+  return 'main';
+}
+
+/**
  * Env files to copy into a worktree (B2). Defaults to `.env.test` ONLY — never
  * `.env`/`.env.production` — so target-repo production secrets aren't exposed to
  * an autonomous agent (which runs with Bash) or swept into the PR diff. The old
@@ -131,9 +163,9 @@ export function createWorktree(repoPath, issueNumber) {
     // Branch doesn't exist, fine
   }
 
-  // Create the worktree with a fresh branch off origin/main (-B force-creates)
+  // Create the worktree with a fresh branch off the base branch (-B force-creates)
   execSync(
-    `git worktree add "${dir}" -B ${branch} origin/main`,
+    `git worktree add "${dir}" -B ${branch} origin/${baseBranch()}`,
     { cwd: repoPath, stdio: 'pipe' }
   );
 

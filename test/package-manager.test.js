@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { detectPackageManager, addDevCommand, lockfileFor, worktreeEnvFiles } from '../src/worktree.js';
+import { detectPackageManager, addDevCommand, lockfileFor, worktreeEnvFiles, baseBranch, resolveBaseBranch } from '../src/worktree.js';
 
 function dirWith(lockfile) {
   const d = mkdtempSync(join(tmpdir(), 'orch-pm-'));
@@ -47,6 +47,24 @@ test('addDevCommand builds the right dev-install per manager', () => {
 test('lockfileFor maps manager back to its lockfile for restore', () => {
   assert.equal(lockfileFor('pnpm'), 'pnpm-lock.yaml');
   assert.equal(lockfileFor('npm'), 'package-lock.json');
+});
+
+// #5: the base branch is read live from env, defaulting to 'main' so nothing
+// hardcodes it.
+test('baseBranch: env override wins, else defaults to main', () => {
+  assert.equal(baseBranch({}), 'main');
+  assert.equal(baseBranch({ BASE_BRANCH: 'master' }), 'master');
+  assert.equal(baseBranch({ BASE_BRANCH: 'trunk' }), 'trunk');
+});
+
+// resolveBaseBranch: explicit env wins without touching git; a non-repo path
+// can't detect origin/HEAD and falls back to 'main'. (origin/HEAD detection is
+// covered against a real clone in worktree.integration.test.js.)
+test('resolveBaseBranch: env override wins; falls back to main off a repo', () => {
+  assert.equal(resolveBaseBranch('/nonexistent/path', { BASE_BRANCH: 'develop' }), 'develop');
+  const d = dirWith(null); // a plain dir, not a git repo
+  try { assert.equal(resolveBaseBranch(d, {}), 'main'); }
+  finally { rmSync(d, { recursive: true, force: true }); }
 });
 
 // B2: never copy production secrets into an agent worktree by default.

@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { fetchIssues } from './github.js';
 import { runQueue, resolvePerIssueBudget, checkBudgetConfig } from './dispatcher.js';
-import { cleanupAllWorktrees, resolveRepoNodeBin } from './worktree.js';
+import { cleanupAllWorktrees, resolveRepoNodeBin, resolveBaseBranch } from './worktree.js';
 import { delimiter } from 'path';
 import { runDiscovery } from './discovery.js';
 import { shouldShowMenu, runMenu } from './menu.js';
@@ -69,6 +69,13 @@ async function main() {
     process.env.PATH = `${repoNodeBin}${delimiter}${process.env.PATH}`;
     console.log(`[INIT] Using repo-pinned Node toolchain: ${repoNodeBin}`);
   }
+
+  // Resolve the target repo's base branch ONCE (BASE_BRANCH > origin/HEAD >
+  // 'main') and store it so the worktree, validation, review, PR, and merge
+  // steps all cut from / compare against / merge into the same branch — a repo
+  // on master/trunk no longer fails against a hardcoded 'main' (#5).
+  process.env.BASE_BRANCH = resolveBaseBranch(REPO_LOCAL_PATH);
+  console.log(`[INIT] Base branch: ${process.env.BASE_BRANCH}`);
 
   // Clean up any leftover worktrees from previous runs
   console.log(`[INIT] Cleaning stale worktrees...`);

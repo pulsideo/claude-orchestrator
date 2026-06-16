@@ -1,6 +1,6 @@
 import { execSync } from 'child_process';
 import { validateBranch, getSeverity, getPrForBranch, createPr, mergePr, flagForHumanReview, deleteRemoteBranch, waitForChecks } from './github.js';
-import { createWorktree, removeWorktree } from './worktree.js';
+import { createWorktree, removeWorktree, baseBranch } from './worktree.js';
 import { runTriageAgent, runFixAgent, runReworkAgent, runReviewAgent } from './agent.js';
 import { resolveRole } from './providers.js';
 import { runFixWorkflow } from './workflow.js';
@@ -166,7 +166,7 @@ async function attemptMerge(worktree) {
     try {
       const pr = await getPrForBranch(GITHUB_OWNER, GITHUB_REPO, worktree.branch);
       if (!pr) return false;
-      console.log(`[MERGE] Merging PR #${pr.number} into main...`);
+      console.log(`[MERGE] Merging PR #${pr.number} into ${baseBranch()}...`);
       await mergePr(GITHUB_OWNER, GITHUB_REPO, pr.number);
       console.log(`[MERGE] PR #${pr.number} merged successfully.`);
       try {
@@ -182,8 +182,8 @@ async function attemptMerge(worktree) {
       if ((isStaleBase || isNotMergeable) && attempt < MAX_MERGE_RETRIES) {
         console.log(`[MERGE] ${isStaleBase ? 'Base branch changed' : 'PR not mergeable (likely conflict)'}. Rebasing and retrying (${attempt}/${MAX_MERGE_RETRIES})...`);
         try {
-          execSync('git fetch origin main', { cwd: worktree.dir, stdio: 'pipe' });
-          execSync('git rebase origin/main', { cwd: worktree.dir, stdio: 'pipe' });
+          execSync(`git fetch origin ${baseBranch()}`, { cwd: worktree.dir, stdio: 'pipe' });
+          execSync(`git rebase origin/${baseBranch()}`, { cwd: worktree.dir, stdio: 'pipe' });
           execSync(`git push origin ${worktree.branch} --force-with-lease`, { cwd: worktree.dir, stdio: 'pipe' });
           // We re-validate (tests/lint) after the rebase but deliberately do NOT
           // re-run review (D2): a rebase that merely catches up to main rarely
