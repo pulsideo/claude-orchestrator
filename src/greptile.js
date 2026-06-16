@@ -1,5 +1,6 @@
 import { execSync } from 'child_process';
 import { parseReviewVerdict } from './agent.js';
+import { baseBranch } from './worktree.js';
 
 const GREPTILE_API_BASE = 'https://api.greptile.com/v2';
 
@@ -54,7 +55,7 @@ ${diff}
         },
       ],
       repositories: [
-        { remote: 'github', repository: `${GITHUB_OWNER}/${GITHUB_REPO}`, branch: 'main' },
+        { remote: 'github', repository: `${GITHUB_OWNER}/${GITHUB_REPO}`, branch: baseBranch() },
       ],
     }),
   });
@@ -84,8 +85,8 @@ export function interpretGreptileResponse(data) {
 
 export function getDiff(worktreeDir) {
   try {
-    // Committed changes vs origin/main
-    const committed = execSync('git diff origin/main...HEAD', {
+    // Committed changes vs the base branch
+    const committed = execSync(`git diff origin/${baseBranch()}...HEAD`, {
       cwd: worktreeDir,
       encoding: 'utf-8',
       maxBuffer: 5 * 1024 * 1024,

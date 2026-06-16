@@ -4,7 +4,7 @@ import { execSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createWorktree, removeWorktree } from '../src/worktree.js';
+import { createWorktree, removeWorktree, resolveBaseBranch } from '../src/worktree.js';
 
 // A real (offline) git repo with an `origin/main` so we exercise the actual
 // branch/worktree lifecycle the orchestrator uses — no mocks.
@@ -31,6 +31,23 @@ before(() => {
 });
 
 after(() => { try { rmSync(root, { recursive: true, force: true }); } catch {} });
+
+// #5: a repo whose default branch is not 'main' is detected from origin/HEAD,
+// so the orchestrator cuts/validates/merges against the right branch.
+test('resolveBaseBranch detects a non-main default from origin/HEAD', () => {
+  const other = join(root, 'trunk-repo');
+  execSync(`git clone "${join(root, 'origin.git')}" "${other}"`, { stdio: 'pipe' });
+  git('config user.email test@test.com', other);
+  git('config user.name test', other);
+  // Rename the default to a non-main name and publish it as the remote default.
+  git('branch -M trunk', other);
+  git('push -u origin trunk', other);
+  git('remote set-head origin trunk', other);
+
+  assert.equal(resolveBaseBranch(other, {}), 'trunk');
+  // explicit env still overrides detection
+  assert.equal(resolveBaseBranch(other, { BASE_BRANCH: 'main' }), 'main');
+});
 
 // CRITIQUE #6: removeWorktree takes a `branch` arg but never deletes it, so
 // fix/issue-N branches accumulate in the repo after each run.

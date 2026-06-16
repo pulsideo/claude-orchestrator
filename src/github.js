@@ -2,7 +2,7 @@ import { Octokit } from '@octokit/rest';
 import { execSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { detectPackageManager } from './worktree.js';
+import { detectPackageManager, baseBranch } from './worktree.js';
 
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
@@ -159,9 +159,9 @@ export function detectLintCommand(worktreeDir, env = process.env) {
   return null;
 }
 
-function collectChangedFiles(worktreeDir) {
+function collectChangedFiles(worktreeDir, env = process.env) {
   const ranges = [
-    'git diff --name-only origin/main...HEAD',
+    `git diff --name-only origin/${baseBranch(env)}...HEAD`,
     'git diff --name-only --cached',
     'git diff --name-only',
   ];
@@ -284,7 +284,7 @@ function runRelatedTests(worktreeDir, codeFiles, env = process.env) {
   const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: worktreeDir, encoding: 'utf-8' }).trim();
   let base;
   try {
-    execSync('git checkout origin/main --quiet', { cwd: worktreeDir, stdio: 'pipe' });
+    execSync(`git checkout origin/${baseBranch(env)} --quiet`, { cwd: worktreeDir, stdio: 'pipe' });
     base = runTestSuite(worktreeDir, plan);
   } finally {
     execSync(`git checkout ${currentBranch} --quiet`, { cwd: worktreeDir, stdio: 'pipe' });
@@ -295,8 +295,8 @@ function runRelatedTests(worktreeDir, codeFiles, env = process.env) {
     if (base.outcome === 'error') {
       // Same on a clean main → environmental. We did NOT validate the fix, so
       // (unlike the old code) we do NOT pass the gate — hand it to a human.
-      console.warn(`[VALIDATE] tests could not run on either the fix branch or origin/main — unable to validate; handing to human review.\n${fix.detail}`);
-      return { passed: false, unvalidated: true, error: `Tests could not run on the fix branch or a clean origin/main:\n${fix.detail}` };
+      console.warn(`[VALIDATE] tests could not run on either the fix branch or origin/${baseBranch(env)} — unable to validate; handing to human review.\n${fix.detail}`);
+      return { passed: false, unvalidated: true, error: `Tests could not run on the fix branch or a clean origin/${baseBranch(env)}:\n${fix.detail}` };
     }
     // Tests run on main but crash on the branch → the fix broke the run itself.
     return { passed: false, error: `The fix prevents the related tests from running:\n${fix.detail}` };
@@ -313,10 +313,10 @@ function runRelatedTests(worktreeDir, codeFiles, env = process.env) {
   // Whole-suite script: fix failed. Blame it only if main was green; if main is
   // also red we can't attribute the failure, so fail closed to human review.
   if (base.outcome === 'pass') {
-    return { passed: false, error: `The fix's test suite fails (clean on origin/main):\n${fix.detail}` };
+    return { passed: false, error: `The fix's test suite fails (clean on origin/${baseBranch(env)}):\n${fix.detail}` };
   }
-  console.warn(`[VALIDATE] the test suite fails on both the fix branch and origin/main — pre-existing breakage, unable to validate the fix.`);
-  return { passed: false, unvalidated: true, error: `Test suite fails on both the fix branch and a clean origin/main; cannot attribute to the fix.` };
+  console.warn(`[VALIDATE] the test suite fails on both the fix branch and origin/${baseBranch(env)} — pre-existing breakage, unable to validate the fix.`);
+  return { passed: false, unvalidated: true, error: `Test suite fails on both the fix branch and a clean origin/${baseBranch(env)}; cannot attribute to the fix.` };
 }
 
 function lintOnce(cmd, worktreeDir) {
@@ -340,7 +340,7 @@ function runLintGate(worktreeDir, env) {
   const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: worktreeDir, encoding: 'utf-8' }).trim();
   let baseOk;
   try {
-    execSync('git checkout origin/main --quiet', { cwd: worktreeDir, stdio: 'pipe' });
+    execSync(`git checkout origin/${baseBranch(env)} --quiet`, { cwd: worktreeDir, stdio: 'pipe' });
     baseOk = lintOnce(cmd, worktreeDir).ok;
   } finally {
     execSync(`git checkout ${currentBranch} --quiet`, { cwd: worktreeDir, stdio: 'pipe' });
@@ -361,7 +361,7 @@ function runLintGate(worktreeDir, env) {
  */
 export async function validateBranch(worktreeDir, env = process.env) {
   try {
-    const changed = collectChangedFiles(worktreeDir);
+    const changed = collectChangedFiles(worktreeDir, env);
 
     // A fix that produced no diff at all is a non-fix — never confirm it (A3).
     if (changed.length === 0) {
@@ -449,7 +449,7 @@ export async function getPrForBranch(owner, repo, branch) {
  * orchestrator owns PR creation so a PR reliably exists before the review loop
  * and the human handoff (ADR 0003) — the fix agent no longer runs `gh pr create`.
  */
-export async function createPr(owner, repo, branch, title, body, base = 'main') {
+export async function createPr(owner, repo, branch, title, body, base = baseBranch()) {
   const existing = await getPrForBranch(owner, repo, branch);
   if (existing) return existing;
   const { data } = await withRetry(
