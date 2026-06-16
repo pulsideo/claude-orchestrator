@@ -10,7 +10,6 @@ import { logResult, getRunCost, startRun, reserveBudget, releaseBudget, recordRu
 const {
   GITHUB_OWNER,
   GITHUB_REPO,
-  AUTO_MERGE = 'false',
 } = process.env;
 
 // Map a failing validation stage to the terminal status reported for the issue.
@@ -43,6 +42,16 @@ const UNVALIDATED_REASON = {
  */
 export function noCodeChangeAction(env = process.env) {
   return env.NO_CODE_CHANGE_ACTION === 'rework' ? 'rework' : 'human-review';
+}
+
+/**
+ * Whether auto-merge is enabled, read LIVE from env. The interactive menu mutates
+ * process.env.AUTO_MERGE after this module is imported, so a value captured at
+ * import time goes stale and contradicts the printed config. Read it at the point
+ * of use instead.
+ */
+export function autoMergeEnabled(env = process.env) {
+  return env.AUTO_MERGE === 'true';
 }
 
 /** Terminal status for a failed validation stage. */
@@ -451,7 +460,7 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
         // Fail closed when we'd otherwise auto-merge: an unevaluable CI check
         // must not be treated as green. Without auto-merge the PR is left for a
         // human anyway, so proceeding is safe.
-        if (AUTO_MERGE === 'true') {
+        if (autoMergeEnabled()) {
           console.warn(`[CI] Could not evaluate CI checks: ${err.message}. Auto-merge on → blocking merge, flagging for human review.`);
           ciFailed = true;
         } else {
@@ -463,7 +472,7 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
     // Phase 6: auto-merge only when confirmed + CI ok + opted in; otherwise leave
     // the PR open, flagging for human review when the fix isn't confirmed.
     let merged = false;
-    if (confirmed && !ciFailed && AUTO_MERGE === 'true' && GITHUB_OWNER && GITHUB_REPO) {
+    if (confirmed && !ciFailed && autoMergeEnabled() && GITHUB_OWNER && GITHUB_REPO) {
       merged = await attemptMerge(worktree);
     } else if ((blockingAtCap || ciFailed) && GITHUB_OWNER && GITHUB_REPO) {
       try {

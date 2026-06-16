@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveStatus, statusForStage, loopDecision, checkBudgetConfig, resolvePerIssueBudget, noCodeChangeAction } from '../src/dispatcher.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { resolveStatus, statusForStage, loopDecision, checkBudgetConfig, resolvePerIssueBudget, noCodeChangeAction, autoMergeEnabled } from '../src/dispatcher.js';
 import { parseReviewVerdict } from '../src/agent.js';
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 // CRITIQUE #2: a passing fix with no PR must NOT be reported as success.
 test('no PR is reported as no-pr, never success', () => {
@@ -56,6 +61,25 @@ test('noCodeChangeAction: human-review by default, rework only when opted in', (
   assert.equal(noCodeChangeAction({ NO_CODE_CHANGE_ACTION: 'rework' }), 'rework');
   assert.equal(noCodeChangeAction({ NO_CODE_CHANGE_ACTION: 'human-review' }), 'human-review');
   assert.equal(noCodeChangeAction({ NO_CODE_CHANGE_ACTION: 'nonsense' }), 'human-review');
+});
+
+// #1: AUTO_MERGE is read live from env (the menu mutates it after import).
+test('autoMergeEnabled reads env live, defaulting off', () => {
+  assert.equal(autoMergeEnabled({}), false);
+  assert.equal(autoMergeEnabled({ AUTO_MERGE: 'false' }), false);
+  assert.equal(autoMergeEnabled({ AUTO_MERGE: 'true' }), true);
+  // a value the menu sets after import is honored (no stale import-time capture)
+  const env = {};
+  env.AUTO_MERGE = 'true';
+  assert.equal(autoMergeEnabled(env), true);
+});
+
+// #3: a plain `cp .env.example .env` must leave Greptile off so the documented
+// review-agent default runs instead of failing auth on a placeholder key.
+test('.env.example ships GREPTILE_API_KEY commented out', () => {
+  const example = readFileSync(join(repoRoot, '.env.example'), 'utf-8');
+  const active = example.split('\n').filter(l => /^\s*GREPTILE_API_KEY=/.test(l));
+  assert.deepEqual(active, [], 'GREPTILE_API_KEY should not be active in .env.example');
 });
 
 // --- fix→review loop decisions (ADR 0002) ---------------------------------
