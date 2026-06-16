@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveStatus, statusForStage, loopDecision, checkBudgetConfig, resolvePerIssueBudget } from '../src/dispatcher.js';
+import { resolveStatus, statusForStage, loopDecision, checkBudgetConfig, resolvePerIssueBudget, noCodeChangeAction } from '../src/dispatcher.js';
 import { parseReviewVerdict } from '../src/agent.js';
 
 // CRITIQUE #2: a passing fix with no PR must NOT be reported as success.
@@ -42,6 +42,13 @@ test('statusForStage maps tests-unvalidated to needs-human-review', () => {
 test('statusForStage maps no-changes and no-code-change (A3)', () => {
   assert.equal(statusForStage('no-changes'), 'no-changes');
   assert.equal(statusForStage('no-code-change'), 'needs-human-review');
+});
+
+test('noCodeChangeAction: human-review by default, rework only when opted in', () => {
+  assert.equal(noCodeChangeAction({}), 'human-review');
+  assert.equal(noCodeChangeAction({ NO_CODE_CHANGE_ACTION: 'rework' }), 'rework');
+  assert.equal(noCodeChangeAction({ NO_CODE_CHANGE_ACTION: 'human-review' }), 'human-review');
+  assert.equal(noCodeChangeAction({ NO_CODE_CHANGE_ACTION: 'nonsense' }), 'human-review');
 });
 
 // --- fix→review loop decisions (ADR 0002) ---------------------------------

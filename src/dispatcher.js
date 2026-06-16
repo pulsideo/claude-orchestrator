@@ -34,6 +34,17 @@ const UNVALIDATED_REASON = {
   'no-code-change': 'the fix changed no production code, so it could not be validated automatically',
 };
 
+/**
+ * What to do when a fix changes no production code (A3). 'rework' nudges the
+ * agent to make a real change for up to MAX_ITERATIONS before handing off;
+ * 'human-review' (default) hands off immediately. Either way an unfixed
+ * no-code-change ends in needs-human-review — this only chooses whether to try.
+ * Applies to the hand-rolled loop only; the workflow brain has no rework loop.
+ */
+export function noCodeChangeAction(env = process.env) {
+  return env.NO_CODE_CHANGE_ACTION === 'rework' ? 'rework' : 'human-review';
+}
+
 /** Terminal status for a failed validation stage. */
 export function statusForStage(stage) {
   return VALIDATION_STATUS[stage] || 'fix-tests-failed';
@@ -306,13 +317,31 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
         const validation = await validateBranch(worktree.dir);
 
         if (validation.unvalidated) {
-          // The gate couldn't validate the fix (no runner / crashes on a clean
-          // main / no production code changed). Reworking can't close that gap,
-          // so hand straight to a human instead of burning iterations (A1/A3).
           console.log(`[VALIDATE] unvalidated at '${validation.stage}': ${validation.error}`);
           handoffReason = UNVALIDATED_REASON[validation.stage] || 'the fix could not be validated automatically';
-          blockingAtCap = true;
-          break;
+          // A no-code-change can optionally be reworked (NO_CODE_CHANGE_ACTION):
+          // nudge the agent to make a real change while iterations remain, then
+          // fall through to human review if it still produces no code. Every
+          // other unvalidated stage is environmental — reworking can't close it.
+          const reworkNoCode = validation.stage === 'no-code-change'
+            && noCodeChangeAction() === 'rework'
+            && iteration < MAX_ITER;
+          if (!reworkNoCode) {
+            blockingAtCap = true;
+            break;
+          }
+          try {
+            console.log(`[REWORK] Fix changed no production code — nudging the agent to make a real change.`);
+            const r = await runReworkAgent(issue, 'You changed no production code — did you actually fix the issue? Implement the real code change that resolves it, and add or update a test that covers it.', worktree.dir);
+            reworkCost += r.cost;
+            reworkDuration += r.duration;
+            pushBranch(worktree);
+          } catch (err) {
+            console.warn(`[REWORK] failed: ${err.error || err.message}`);
+            blockingAtCap = true;
+            break;
+          }
+          continue;
         }
         if (!validation.passed) {
           console.log(`[VALIDATE] failed at '${validation.stage}' gate: ${validation.error}`);

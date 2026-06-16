@@ -68,6 +68,8 @@ cp .env.example .env
 | `PACKAGE_MANAGER` | Optional. Override worktree package-manager detection (`npm`/`pnpm`/`yarn`/`bun`). Auto-detected from the lockfile otherwise |
 | `EXTRA_TEST_DEPS` | Optional. Space-separated dev deps to install in the worktree; the manifest/lockfile are restored afterward so they never pollute the PR diff |
 | `REQUIRE_TESTS` | Reject a fix that changes code but adds/modifies no test (default: `true`) |
+| `TEST_COMMAND` | Optional. Override the test-gate command; otherwise vitest/jest get scoped related-tests, else the repo's `test` script runs. If no runner can be determined the gate fails closed (the fix is handed to a human, never silently passed) |
+| `NO_CODE_CHANGE_ACTION` | What to do when a fix changes no production code: `human-review` (default — hand off immediately) or `rework` (nudge the agent to make a real change first, then hand off if it still doesn't) |
 | `LINT_COMMAND` | Optional. Override the lint command; otherwise the target repo's `lint` script is used if present |
 | `WAIT_FOR_CI` | Wait for the PR's GitHub CI checks to go green before merging (default: `false`) |
 | `CI_TIMEOUT_MS` / `CI_POLL_INTERVAL_MS` | Tune CI polling (defaults: `600000` / `15000`) |

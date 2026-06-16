@@ -22,7 +22,9 @@ Targets the five gaps from `CRITIQUE1.md`'s successor review plus hygiene items.
   `src/agent.js`. A reviewer *exception* must not become `blocking:false`; a
   review that didn't run cannot yield `confirmed`.
 - **A3. Empty / test-only diffs are not vacuously confirmed** — `src/github.js`.
-  Empty diff ⇒ `no-changes`; test-only diff ⇒ not auto-merged.
+  Empty diff ⇒ `no-changes` (hard fail); no-production-code diff ⇒ human review.
+  `NO_CODE_CHANGE_ACTION` lets the operator choose immediate handoff
+  (`human-review`, default) or a rework nudge first (`rework`).
 - **A4. Accurate human-handoff reason** — `src/github.js`, `src/dispatcher.js`.
   Stop posting the hardcoded "refinement broke tests" message for every handoff.
 
