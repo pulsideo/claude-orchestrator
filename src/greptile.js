@@ -23,8 +23,6 @@ export async function reviewWithGreptile(worktreeDir) {
     return [];
   }
 
-  const repoId = `github:main:${GITHUB_OWNER}/${GITHUB_REPO}`;
-
   const response = await fetch(`${GREPTILE_API_BASE}/query`, {
     method: 'POST',
     headers: {
@@ -64,7 +62,7 @@ ${diff}
   return formatGreptileResponse(data);
 }
 
-function getDiff(worktreeDir) {
+export function getDiff(worktreeDir) {
   try {
     // Committed changes vs origin/main
     const committed = execSync('git diff origin/main...HEAD', {
@@ -78,7 +76,7 @@ function getDiff(worktreeDir) {
       encoding: 'utf-8',
       maxBuffer: 5 * 1024 * 1024,
     });
-    return (committed + staged).trim();
+    return [committed, staged].filter(Boolean).join('\n').trim();
   } catch {
     return '';
   }

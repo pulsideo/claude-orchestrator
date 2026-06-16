@@ -1,0 +1,290 @@
+import { execFileSync } from 'child_process';
+import { readFileSync, existsSync, accessSync, constants } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PRICES_PATH = join(__dirname, '..', 'prices.json');
+
+/**
+ * Parse the JSON emitted by the Claude CLI (`--output-format json`).
+ * Shared by the Claude and Kimi adapters (Kimi runs through the Claude CLI).
+ */
+function parseClaudeJson(stdout) {
+  try {
+    const j = JSON.parse(stdout);
+    const u = j.usage || {};
+    return {
+      output: j.result || stdout,
+      usage: {
+        input: (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0),
+        output: u.output_tokens || 0,
+      },
+    };
+  } catch {
+    return { output: stdout, usage: { input: 0, output: 0 } };
+  }
+}
+
+// Returns argv (excluding the binary). The prompt is fed via the child's stdin,
+// never interpolated into a shell string — so untrusted issue content and the
+// model/tool names cannot inject shell commands.
+function claudeStyleCommand({ model, allowedTools }) {
+  return ['--model', model, '--output-format', 'json', '--allowedTools', allowedTools, '-p'];
+}
+
+// --- Provider adapters -----------------------------------------------------
+// Each adapter knows how to invoke one provider headlessly, parse its output
+// into { output, usage:{input,output} }, and its default model tiers. Model IDs
+// and prices for Codex/Kimi are best-effort defaults — verify and override.
+
+const claude = {
+  name: 'claude',
+  defaultModels: { strong: 'opus', fast: 'sonnet' },
+  binEnv: 'CLAUDE_BIN',
+  binCandidates: ['claude'],
+  command: claudeStyleCommand,
+  extraEnv() { return {}; },
+  parseOutput: parseClaudeJson,
+  // Only Claude can host a dynamic workflow (its sub-agents are Claude). The
+  // workflow brain is gated on this; Codex/Kimi keep the hand-rolled pipeline.
+  supportsWorkflow: true,
+};
+
+// Kimi (Moonshot K2) has no native agentic CLI; drive it through the Claude CLI
+// pointed at Moonshot's Anthropic-compatible endpoint.
+const kimi = {
+  name: 'kimi',
+  defaultModels: { strong: 'kimi-k2-0905-preview', fast: 'kimi-k2-0905-preview' },
+  binEnv: 'CLAUDE_BIN',
+  binCandidates: ['claude'],
+  command: claudeStyleCommand,
+  extraEnv(env = process.env) {
+    return {
+      ANTHROPIC_BASE_URL: env.KIMI_BASE_URL || 'https://api.moonshot.ai/anthropic',
+      ANTHROPIC_AUTH_TOKEN: env.MOONSHOT_API_KEY || env.KIMI_API_KEY || '',
+    };
+  },
+  parseOutput: parseClaudeJson,
+};
+
+const codex = {
+  name: 'codex',
+  defaultModels: { strong: 'gpt-5-codex', fast: 'gpt-5-codex' },
+  binEnv: 'CODEX_BIN',
+  binCandidates: ['codex'],
+  command({ model }) {
+    // codex exec reads the prompt from stdin (trailing `-`); --json emits JSONL.
+    return ['exec', '--json', '--model', model, '--dangerously-bypass-approvals-and-sandbox', '-'];
+  },
+  extraEnv() { return {}; },
+  parseOutput(stdout) {
+    // Tolerant JSONL parse: take the last agent message and any token usage.
+    let output = '';
+    const usage = { input: 0, output: 0 };
+    for (const line of stdout.split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+      let ev;
+      try { ev = JSON.parse(t); } catch { continue; }
+      const msg = ev.msg || ev;
+      const type = msg.type || ev.type;
+      if ((type === 'agent_message' || type === 'message') && (msg.message || msg.text)) {
+        output = msg.message || msg.text;
+      }
+      const u = msg.usage || ev.usage || (type === 'token_count' ? msg : null);
+      if (u) {
+        usage.input = u.input_tokens ?? u.prompt_tokens ?? usage.input;
+        usage.output = u.output_tokens ?? u.completion_tokens ?? usage.output;
+      }
+    }
+    return { output: output || stdout, usage };
+  },
+};
+
+export const REGISTRY = { claude, kimi, codex };
+
+// --- API-key → subscription fallback ---------------------------------------
+// When ANTHROPIC_API_KEY is set, the claude CLI bills the metered API. If that
+// key's credit runs out (HTTP 400 "credit balance is too low"), we can fall
+// back to the user's logged-in subscription by re-invoking the CLI WITHOUT the
+// key. Once tripped, a run-scoped latch drops the key for every later call so we
+// don't keep hammering the dead key. Requires the CLI to be logged into a
+// subscription for the fallback to actually authenticate.
+
+let apiKeyDisabled = false;
+
+/** Fallback is on by default; disable with FALLBACK_TO_SUBSCRIPTION=false. */
+export function fallbackEnabled(env = process.env) {
+  return env.FALLBACK_TO_SUBSCRIPTION !== 'false';
+}
+
+export function isApiKeyDisabled() {
+  return apiKeyDisabled;
+}
+
+/**
+ * What the cost ceiling actually measures, given the active auth. With a live
+ * ANTHROPIC_API_KEY the CLI bills the metered API, so total_cost_usd is real
+ * money. On a subscription login it's NOTIONAL — token count priced at API
+ * rates — since the subscription is flat-rate, not billed per token. Either way
+ * it tracks token volume, NOT remaining weekly subscription usage.
+ */
+export function costModeLabel(env = process.env) {
+  const usingApiKey = !!env.ANTHROPIC_API_KEY && !apiKeyDisabled;
+  return usingApiKey
+    ? 'metered API spend (real USD)'
+    : 'notional token-cost (USD-equiv; subscription is flat-rate, not billed per token, and this does NOT track remaining weekly usage)';
+}
+
+/** Trip the latch (logs once) so the rest of the run uses the subscription. */
+export function disableApiKeyForRun() {
+  if (!apiKeyDisabled) {
+    apiKeyDisabled = true;
+    console.warn('[FALLBACK] Anthropic API credit exhausted — dropping ANTHROPIC_API_KEY and using the subscription login for the rest of this run (requires the claude CLI to be logged into a subscription).');
+  }
+}
+
+/** Reset the latch (new run / tests). */
+export function resetApiKeyFallback() {
+  apiKeyDisabled = false;
+}
+
+// Anthropic's exact 400 on an empty balance reads:
+//   "Your credit balance is too low to access the Anthropic API..."
+export function isCreditExhausted(text = '') {
+  return /credit balance is too low/i.test(String(text));
+}
+
+/**
+ * Build the env for a spawned provider CLI: per-adapter extras (e.g. Kimi's
+ * Moonshot endpoint) minus CLAUDECODE/CLAUDE_CODE_ENTRYPOINT so the child
+ * doesn't think it's nested. Drops ANTHROPIC_API_KEY when the fallback latch is
+ * tripped (or forced), so the claude CLI uses the subscription instead of the
+ * exhausted metered key.
+ */
+export function buildSubprocessEnv(adapter, baseEnv = process.env, { dropApiKey = apiKeyDisabled } = {}) {
+  const env = { ...baseEnv, ...adapter.extraEnv(baseEnv) };
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+  if (dropApiKey) delete env.ANTHROPIC_API_KEY;
+  return env;
+}
+
+// --- Role → provider/model resolution --------------------------------------
+
+const ROLE_TIER = { triage: 'fast', discovery: 'fast', refine: 'fast', review: 'strong' };
+
+function tierForRole(role, severity) {
+  if (role === 'fix') return (severity === 'critical' || severity === 'high') ? 'strong' : 'fast';
+  return ROLE_TIER[role] || 'fast';
+}
+
+function providerForRole(role, env) {
+  const def = env.DEFAULT_PROVIDER || 'claude';
+  if (role === 'review') return env.REVIEW_PROVIDER || def;
+  if (role === 'fix') return env.FIX_PROVIDER || def;
+  return def;
+}
+
+function modelFor(adapter, tier, env) {
+  const prefix = adapter.name.toUpperCase();
+  const override = tier === 'strong' ? env[`${prefix}_MODEL_STRONG`] : env[`${prefix}_MODEL_FAST`];
+  return override || adapter.defaultModels[tier];
+}
+
+/**
+ * Resolve which provider + model a role should run on. Provider comes from
+ * DEFAULT_PROVIDER, with FIX_PROVIDER / REVIEW_PROVIDER overrides; the model
+ * comes from the provider's tier (severity-selected), with per-provider tier
+ * overrides and exact REVIEW_MODEL / FIX_MODEL overrides.
+ */
+export function resolveRole(role, severity, env = process.env) {
+  const providerName = providerForRole(role, env);
+  const adapter = REGISTRY[providerName];
+  if (!adapter) {
+    throw new Error(`Unknown provider '${providerName}' for role '${role}'. Known: ${Object.keys(REGISTRY).join(', ')}`);
+  }
+  const tier = tierForRole(role, severity);
+  const exact = role === 'review' ? env.REVIEW_MODEL : role === 'fix' ? env.FIX_MODEL : undefined;
+  const model = exact || modelFor(adapter, tier, env);
+  return { provider: providerName, adapter, model, tier };
+}
+
+/**
+ * The CLAUDE model a role/severity maps to, ignoring provider selection. The
+ * workflow brain's sub-agents are ALWAYS Claude, so REVIEW_PROVIDER/FIX_PROVIDER
+ * must not leak a non-Claude model id (e.g. gpt-5-codex) into a Claude agent()
+ * call. Still honors severity tiers and CLAUDE_MODEL_STRONG/FAST overrides.
+ */
+export function claudeModelForRole(role, severity, env = process.env) {
+  return modelFor(REGISTRY.claude, tierForRole(role, severity), env);
+}
+
+/**
+ * Warn when the workflow brain will run (USE_WORKFLOW + a Claude fix provider)
+ * but a non-Claude REVIEW_PROVIDER/DEFAULT_PROVIDER is set — those are ignored
+ * on the workflow path (its review/triage are Claude sub-agents). Returns the
+ * warning string, or null if there's nothing to warn about.
+ */
+export function workflowOverrideWarning(env = process.env) {
+  if (env.USE_WORKFLOW !== 'true') return null;
+  // If the fix provider can't host a workflow, the brain won't run — no warning.
+  if (!resolveRole('fix', 'high', env).adapter.supportsWorkflow) return null;
+  const reviewProvider = env.REVIEW_PROVIDER || env.DEFAULT_PROVIDER || 'claude';
+  const triageProvider = env.DEFAULT_PROVIDER || 'claude';
+  if (reviewProvider === 'claude' && triageProvider === 'claude') return null;
+  return `USE_WORKFLOW=true runs the Claude workflow brain — its triage/fix/review sub-agents are always Claude, so REVIEW_PROVIDER='${reviewProvider}' / DEFAULT_PROVIDER='${triageProvider}' are ignored on the workflow path. For cross-vendor review (e.g. Codex reviewing a Claude fix), set USE_WORKFLOW=false.`;
+}
+
+// --- Cost -------------------------------------------------------------------
+
+let pricesCache;
+
+/** Load the per-model price table (USD per 1M tokens), merging MODEL_PRICES env JSON. */
+export function loadPrices(env = process.env) {
+  if (!pricesCache) {
+    let base = {};
+    if (existsSync(PRICES_PATH)) {
+      try { base = JSON.parse(readFileSync(PRICES_PATH, 'utf-8')); } catch { base = {}; }
+    }
+    let override = {};
+    if (env.MODEL_PRICES) {
+      try { override = JSON.parse(env.MODEL_PRICES); } catch { override = {}; }
+    }
+    pricesCache = { ...base, ...override };
+  }
+  return pricesCache;
+}
+
+/**
+ * Estimate USD cost from token usage and a price table. Unknown models return 0
+ * (the caller is expected to warn) so the cost ceiling degrades loudly.
+ */
+export function estimateCost(model, usage, prices) {
+  const p = prices?.[model];
+  if (!p) return 0;
+  const input = usage?.input || 0;
+  const output = usage?.output || 0;
+  return (input / 1_000_000) * (p.input || 0) + (output / 1_000_000) * (p.output || 0);
+}
+
+/** Resolve the executable for an adapter: env override → PATH → common locations → bare name. */
+export function resolveBin(adapter, env = process.env) {
+  if (env[adapter.binEnv]) return env[adapter.binEnv];
+  for (const candidate of adapter.binCandidates) {
+    try {
+      return execFileSync('which', [candidate], { encoding: 'utf-8' }).trim();
+    } catch {
+      // not on PATH — try next
+    }
+  }
+  const fallbacks = [
+    join(env.HOME || '', '.local', 'bin', adapter.binCandidates[0]),
+    `/usr/local/bin/${adapter.binCandidates[0]}`,
+  ];
+  for (const p of fallbacks) {
+    try { accessSync(p, constants.X_OK); return p; } catch { /* keep looking */ }
+  }
+  return adapter.binCandidates[0];
+}

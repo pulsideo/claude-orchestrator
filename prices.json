@@ -1,0 +1,8 @@
+{
+  "_comment": "USD per 1,000,000 tokens. Defaults are approximate — verify against current provider pricing and override here or via MODEL_PRICES.",
+  "opus": { "input": 15, "output": 75 },
+  "sonnet": { "input": 3, "output": 15 },
+  "haiku": { "input": 1, "output": 5 },
+  "gpt-5-codex": { "input": 1.25, "output": 10 },
+  "kimi-k2-0905-preview": { "input": 0.6, "output": 2.5 }
+}
