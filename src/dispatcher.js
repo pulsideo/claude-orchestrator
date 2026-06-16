@@ -15,14 +15,23 @@ const {
 
 // Map a failing validation stage to the terminal status reported for the issue.
 const VALIDATION_STATUS = {
+  // The fix produced no diff at all — a hard fail, nothing to review (A3).
+  'no-changes': 'no-changes',
   'tests-missing': 'tests-missing',
   tests: 'fix-tests-failed',
-  // Tests we couldn't validate are a human handoff, not a hard fail — routed via
-  // the needs-human-review path, but mapped here too as a safety net (A1).
+  // Stages we couldn't validate are a human handoff, not a hard fail — routed
+  // via the needs-human-review path, but mapped here too as a safety net.
   'tests-unvalidated': 'needs-human-review',
+  'no-code-change': 'needs-human-review',
   lint: 'lint-failed',
   ci: 'ci-failed',
   error: 'validation-error',
+};
+
+// Human-readable handoff reason for a stage we couldn't validate (A3/A4).
+const UNVALIDATED_REASON = {
+  'tests-unvalidated': 'tests could not be validated (no runner, or they crash on a clean main)',
+  'no-code-change': 'the fix changed no production code, so it could not be validated automatically',
 };
 
 /** Terminal status for a failed validation stage. */
@@ -56,22 +65,28 @@ export function resolveStatus({ merged, needsHumanReview, ciFailed, prExists }) 
   return 'success';
 }
 
-/** Acquire a review for the current branch: Greptile if configured, else the reviewer provider. */
+/**
+ * Acquire a review for the current branch: Greptile if configured, else the
+ * reviewer provider. Returns `ran` so the caller can fail CLOSED (A2): a review
+ * that errored (ran:false) must NOT be treated as "no blocking findings" — the
+ * old code did, so a crashed reviewer silently confirmed the fix. ENABLE_REVIEW
+ * =false is a deliberate skip (ran:true), not a failure.
+ */
 async function acquireReview(issue, worktreeDir) {
   try {
     if (process.env.GREPTILE_API_KEY) {
       const comments = await reviewWithGreptile(worktreeDir);
-      return { blocking: comments.length > 0, comments, cost: 0 };
+      return { blocking: comments.length > 0, comments, cost: 0, ran: true };
     }
     if (process.env.ENABLE_REVIEW === 'false') {
-      return { blocking: false, comments: [], cost: 0 };
+      return { blocking: false, comments: [], cost: 0, ran: true };
     }
     const review = await runReviewAgent(issue, getDiff(worktreeDir), worktreeDir);
     console.log(`[REVIEW] ${review.provider}/${review.model}: ${review.blocking ? 'changes requested' : 'no blocking findings'} ($${review.cost.toFixed(4)})`);
-    return { blocking: review.blocking, comments: review.comments, cost: review.cost };
+    return { blocking: review.blocking, comments: review.comments, cost: review.cost, ran: true };
   } catch (err) {
-    console.warn(`[REVIEW] Review failed: ${err.error || err.message}. Treating as no blocking findings.`);
-    return { blocking: false, comments: [], cost: 0 };
+    console.warn(`[REVIEW] Review failed: ${err.error || err.message}. Cannot confirm without a review — handing to human.`);
+    return { blocking: false, comments: [], cost: 0, ran: false };
   }
 }
 
@@ -231,9 +246,9 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
       // Authoritative gate — never trust the workflow's self-report.
       const validation = await validateBranch(worktree.dir);
       if (validation.unvalidated) {
-        // Couldn't validate the tests → hand to a human, never confirm (A1).
-        console.log(`[VALIDATE] tests unvalidated: ${validation.error}`);
-        handoffReason = 'tests could not be validated (no runner, or they crash on a clean main)';
+        // Couldn't validate the fix → hand to a human, never confirm (A1/A3).
+        console.log(`[VALIDATE] unvalidated at '${validation.stage}': ${validation.error}`);
+        handoffReason = UNVALIDATED_REASON[validation.stage] || 'the fix could not be validated automatically';
         blockingAtCap = true;
       } else if (!validation.passed) {
         console.log(`[VALIDATE] authoritative gate failed at '${validation.stage}': ${validation.error}`);
@@ -291,11 +306,11 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
         const validation = await validateBranch(worktree.dir);
 
         if (validation.unvalidated) {
-          // The test gate couldn't validate the fix (no runner, or it crashes on
-          // a clean main too). Reworking can't fix an environmental gap, so hand
-          // straight to a human instead of burning iterations (A1).
-          console.log(`[VALIDATE] tests unvalidated: ${validation.error}`);
-          handoffReason = 'tests could not be validated (no runner, or they crash on a clean main)';
+          // The gate couldn't validate the fix (no runner / crashes on a clean
+          // main / no production code changed). Reworking can't close that gap,
+          // so hand straight to a human instead of burning iterations (A1/A3).
+          console.log(`[VALIDATE] unvalidated at '${validation.stage}': ${validation.error}`);
+          handoffReason = UNVALIDATED_REASON[validation.stage] || 'the fix could not be validated automatically';
           blockingAtCap = true;
           break;
         }
@@ -321,6 +336,12 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
 
         const review = await acquireReview(issue, worktree.dir);
         reviewCost += review.cost;
+        if (!review.ran) {
+          // The reviewer errored — we cannot confirm without a review (A2).
+          handoffReason = 'code review could not be completed';
+          blockingAtCap = true;
+          break;
+        }
         const decision = loopDecision({ validationPassed: true, blocking: review.blocking, iteration, maxIterations: MAX_ITER });
         if (decision === 'confirmed') { confirmed = true; break; }
         if (decision === 'unconfirmed-blocking') { blockingAtCap = true; break; }

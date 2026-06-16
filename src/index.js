@@ -122,9 +122,10 @@ async function main() {
   const noPr = results.filter(r => r.status === 'no-pr').length;
   const fixTestsFailed = results.filter(r => r.status === 'fix-tests-failed').length;
   const testsMissing = results.filter(r => r.status === 'tests-missing').length;
+  const noChanges = results.filter(r => r.status === 'no-changes').length;
   const lintFailed = results.filter(r => r.status === 'lint-failed').length;
   const ciFailed = results.filter(r => r.status === 'ci-failed').length;
-  const knownStatuses = ['merged', 'success', 'no-pr', 'needs-human-review', 'fix-tests-failed', 'tests-missing', 'lint-failed', 'ci-failed', 'dry-run'];
+  const knownStatuses = ['merged', 'success', 'no-pr', 'needs-human-review', 'fix-tests-failed', 'tests-missing', 'no-changes', 'lint-failed', 'ci-failed', 'dry-run'];
   const errored = results.filter(r => !knownStatuses.includes(r.status)).length;
   const dryRunCount = results.filter(r => r.status === 'dry-run').length;
 
@@ -141,6 +142,9 @@ async function main() {
     }
     if (testsMissing > 0) {
       console.log(`Fix added no tests (rejected): ${testsMissing}`);
+    }
+    if (noChanges > 0) {
+      console.log(`No changes produced (rejected): ${noChanges}`);
     }
     if (lintFailed > 0) {
       console.log(`Lint failed: ${lintFailed}`);

@@ -308,6 +308,8 @@ function runLintGate(worktreeDir, env) {
 /**
  * Validate a fix branch through ordered gates. Returns the failing `stage` so
  * the caller can report a precise status:
+ *   no-changes        → the fix produced no diff at all (hard fail)
+ *   no-code-change    → only test/config/docs changed (fails closed → human)
  *   tests-missing     → code changed but no test added/modified
  *   tests             → new test failures introduced by the fix
  *   tests-unvalidated → tests could not be run/validated (fails closed → human)
@@ -315,9 +317,26 @@ function runLintGate(worktreeDir, env) {
  */
 export async function validateBranch(worktreeDir, env = process.env) {
   try {
-    const { code, tests } = classifyChangedFiles(collectChangedFiles(worktreeDir));
+    const changed = collectChangedFiles(worktreeDir);
 
-    if (code.length === 0) return { passed: true }; // no production code changed
+    // A fix that produced no diff at all is a non-fix — never confirm it (A3).
+    if (changed.length === 0) {
+      return { passed: false, stage: 'no-changes', error: 'The fix produced no changes.' };
+    }
+
+    const { code, tests } = classifyChangedFiles(changed);
+
+    // No production code changed (test-only, config-only, or docs-only). The
+    // code/test gate can't validate such a change, and a "fix" that touches no
+    // production code is suspicious → hand to a human, never auto-confirm (A3).
+    if (code.length === 0) {
+      return {
+        passed: false,
+        stage: 'no-code-change',
+        unvalidated: true,
+        error: `The fix changed no production code (only: ${changed.join(', ')}). Cannot validate automatically.`,
+      };
+    }
 
     // Gate: a fix that changes code must add or modify tests.
     if (requireTests(env) && tests.length === 0) {

@@ -38,6 +38,12 @@ test('statusForStage maps tests-unvalidated to needs-human-review', () => {
   assert.equal(statusForStage('tests-unvalidated'), 'needs-human-review');
 });
 
+// A3: empty diff is a hard fail; a no-production-code diff is a human handoff.
+test('statusForStage maps no-changes and no-code-change (A3)', () => {
+  assert.equal(statusForStage('no-changes'), 'no-changes');
+  assert.equal(statusForStage('no-code-change'), 'needs-human-review');
+});
+
 // --- fix→review loop decisions (ADR 0002) ---------------------------------
 
 test('loopDecision: failed gates rework while iterations remain, else fail', () => {
