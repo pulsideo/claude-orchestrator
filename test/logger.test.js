@@ -8,7 +8,7 @@ import { rmSync } from 'node:fs';
 const LOG = join(tmpdir(), `orch-test-log-${process.pid}.json`);
 process.env.RUN_LOG_PATH = LOG;
 
-const { startRun, logResult, getRunCost, getLifetimeCost, reserveBudget, releaseBudget, getCommittedCost } = await import('../src/logger.js');
+const { startRun, logResult, getRunCost, getLifetimeCost, reserveBudget, releaseBudget, getCommittedCost, recordRunCost } = await import('../src/logger.js');
 
 after(() => { try { rmSync(LOG); } catch {} });
 
@@ -62,4 +62,14 @@ test('startRun resets reservations as well as spend', () => {
   reserveBudget(30, 50);
   startRun();
   assert.equal(getCommittedCost(), 0, 'a new run clears reservations');
+});
+
+// C1: discovery spend (which doesn't go through logResult) must count against
+// the ceiling, and a reservation must then see it as already committed.
+test('recordRunCost adds out-of-band spend (discovery) to the run total', () => {
+  startRun();
+  recordRunCost(7);
+  assert.equal(getRunCost(), 7, 'discovery spend counts toward the run');
+  assert.equal(getCommittedCost(), 7, 'and toward committed for reservations');
+  assert.equal(reserveBudget(5, 10), false, '7 + 5 > 10 ceiling → blocked by prior discovery spend');
 });

@@ -24,6 +24,13 @@ test('failing CI blocks success', () => {
   assert.equal(resolveStatus({ merged: false, needsHumanReview: false, ciFailed: true, prExists: true }), 'ci-failed');
 });
 
+// C2: an issue that exhausts its per-issue budget is a distinct handoff cause.
+test('over-budget reports over-budget, beating the generic human-review handoff', () => {
+  assert.equal(resolveStatus({ merged: false, needsHumanReview: true, overBudget: true, prExists: true }), 'over-budget');
+  // but a merge still wins (e.g. budget hit after a confirmed merge is moot)
+  assert.equal(resolveStatus({ merged: true, overBudget: true, prExists: true }), 'merged');
+});
+
 test('statusForStage maps validation stages to terminal statuses', () => {
   assert.equal(statusForStage('tests-missing'), 'tests-missing');
   assert.equal(statusForStage('tests'), 'fix-tests-failed');

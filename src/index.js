@@ -75,11 +75,17 @@ async function main() {
   cleanupAllWorktrees(REPO_LOCAL_PATH);
 
   // Optional discovery phase: scan the target repo and file new issues, which
-  // the queue below then processes in the same run (ADR 0001).
+  // the queue below then processes in the same run (ADR 0001). Its spend counts
+  // against the cost ceiling (C1) — passed into runQueue as priorCost.
+  let discoveryCost = 0;
   if (process.env.DISCOVERY === 'true' && !DRY_RUN) {
     try {
-      const { filed } = await runDiscovery(GITHUB_OWNER, GITHUB_REPO, REPO_LOCAL_PATH);
-      console.log(`[DISCOVERY] Filed ${filed.length} new issue(s).`);
+      const { filed, cost } = await runDiscovery(GITHUB_OWNER, GITHUB_REPO, REPO_LOCAL_PATH);
+      discoveryCost = cost || 0;
+      console.log(`[DISCOVERY] Filed ${filed.length} new issue(s) ($${discoveryCost.toFixed(4)}).`);
+      if (discoveryCost >= costCeiling) {
+        console.warn(`[DISCOVERY] Discovery alone ($${discoveryCost.toFixed(2)}) reached the $${costCeiling} ceiling — no issues will be dispatched.`);
+      }
     } catch (err) {
       console.warn(`[DISCOVERY] Discovery failed: ${err.error || err.message}. Continuing with existing issues.`);
     }
@@ -106,6 +112,7 @@ async function main() {
     concurrency,
     costCeiling,
     !!DRY_RUN,
+    { priorCost: discoveryCost },
   );
 
   // Final cleanup
@@ -123,9 +130,10 @@ async function main() {
   const fixTestsFailed = results.filter(r => r.status === 'fix-tests-failed').length;
   const testsMissing = results.filter(r => r.status === 'tests-missing').length;
   const noChanges = results.filter(r => r.status === 'no-changes').length;
+  const overBudget = results.filter(r => r.status === 'over-budget').length;
   const lintFailed = results.filter(r => r.status === 'lint-failed').length;
   const ciFailed = results.filter(r => r.status === 'ci-failed').length;
-  const knownStatuses = ['merged', 'success', 'no-pr', 'needs-human-review', 'fix-tests-failed', 'tests-missing', 'no-changes', 'lint-failed', 'ci-failed', 'dry-run'];
+  const knownStatuses = ['merged', 'success', 'no-pr', 'needs-human-review', 'over-budget', 'fix-tests-failed', 'tests-missing', 'no-changes', 'lint-failed', 'ci-failed', 'dry-run'];
   const errored = results.filter(r => !knownStatuses.includes(r.status)).length;
   const dryRunCount = results.filter(r => r.status === 'dry-run').length;
 
@@ -136,6 +144,9 @@ async function main() {
     console.log(`Success (PR open, pending human review): ${success}`);
     if (needsReview > 0) {
       console.log(`Needs human review (refinement reverted): ${needsReview}`);
+    }
+    if (overBudget > 0) {
+      console.log(`Over per-issue budget (handed to human): ${overBudget}`);
     }
     if (noPr > 0) {
       console.log(`No PR opened (fix pushed but no PR found): ${noPr}`);

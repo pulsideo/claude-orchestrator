@@ -49,13 +49,13 @@ cp .env.example .env
 | `GITHUB_REPO` | Repository name |
 | `REPO_LOCAL_PATH` | Absolute path to your local clone |
 | `MAX_CONCURRENCY` | Parallel agents (default: 3, max recommended: 5) |
-| `COST_CEILING_USD` | Stop processing after this spend **for the current run** (default: 50) |
+| `COST_CEILING_USD` | Stop processing after this spend **for the current run**, including the discovery phase (default: 50) |
 | `MAX_ITERATIONS` | Fix→review loop cap before leaving the PR for a human (default: 3) |
 | `DISCOVERY` | Set `true` to scan the repo and file new issues before processing (default off) |
 | `DISCOVERY_SCOPE` / `DISCOVERY_MAX` | Free-text discovery scope, and max new issues filed per run (default 5) |
 | `AUTO_MERGE` | Squash-merge confirmed PRs and delete the branch (default: `false` — leave for human review) |
 | `USE_WORKFLOW` | Run the per-issue brain as a Claude dynamic workflow (triage→fix→adversarial-review convergence) instead of the hand-rolled loop. Claude fix-provider only; Codex/Kimi unaffected (default: `false`, see ADR 0007) |
-| `PER_ISSUE_BUDGET_USD` | USD reserved per issue before it starts (caps concurrent overspend) and passed to the workflow as a hard `--max-budget-usd`. Default: `COST_CEILING_USD` ÷ effective concurrency |
+| `PER_ISSUE_BUDGET_USD` | USD budget per issue. Reserved before the issue starts (caps concurrent overspend); the workflow path enforces it as a hard `--max-budget-usd`, and the hand-rolled loop stops once cumulative spend reaches it (`over-budget` → human review). Default: `COST_CEILING_USD` ÷ effective concurrency |
 | `PER_ISSUE_TOKEN_BUDGET` | Optional in-workflow token backstop on the convergence loop |
 | `DEFAULT_PROVIDER` | Provider for triage/refine/discovery (`claude`/`codex`/`kimi`, default `claude`) |
 | `FIX_PROVIDER` / `REVIEW_PROVIDER` | Override the provider for the fix and reviewer roles |

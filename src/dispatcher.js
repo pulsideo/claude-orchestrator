@@ -5,7 +5,7 @@ import { runTriageAgent, runFixAgent, runReworkAgent, runReviewAgent } from './a
 import { resolveRole } from './providers.js';
 import { runFixWorkflow } from './workflow.js';
 import { reviewWithGreptile, getDiff } from './greptile.js';
-import { logResult, getRunCost, startRun, reserveBudget, releaseBudget } from './logger.js';
+import { logResult, getRunCost, startRun, reserveBudget, releaseBudget, recordRunCost } from './logger.js';
 
 const {
   GITHUB_OWNER,
@@ -68,8 +68,10 @@ export function loopDecision({ validationPassed, blocking, iteration, maxIterati
  * never 'success' (CRITIQUE #2) — so the run summary can't claim a fix landed
  * when nothing was opened.
  */
-export function resolveStatus({ merged, needsHumanReview, ciFailed, prExists }) {
+export function resolveStatus({ merged, needsHumanReview, overBudget, ciFailed, prExists }) {
   if (merged) return 'merged';
+  // over-budget is a human handoff too, but a distinct, more specific cause (C2).
+  if (overBudget) return 'over-budget';
   if (needsHumanReview) return 'needs-human-review';
   if (ciFailed) return 'ci-failed';
   if (!prExists) return 'no-pr';
@@ -227,6 +229,7 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
     // hand-rolled triage→fix→loop (Codex/Kimi, or USE_WORKFLOW off).
     let confirmed = false;
     let blockingAtCap = false;
+    let overBudget = false;
     let failStage = null;
     // Human-handoff reason, surfaced on the PR when we flag it (A4). Overridden
     // when the cause is something other than blocking review findings.
@@ -314,6 +317,21 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
 
       for (let iteration = 1; iteration <= MAX_ITER; iteration++) {
         console.log(`[LOOP] Iteration ${iteration}/${MAX_ITER}`);
+
+        // Real per-issue spend cap (C2). The workflow path gets --max-budget-usd;
+        // the hand-rolled agents take no budget arg, so without this an issue can
+        // run every iteration regardless of cost — the reservation only bounded
+        // concurrency. Stop before starting more agent work once spend ≥ the cap;
+        // hand the already-made fix to a human rather than overspending further.
+        const spent = (triageResult?.cost || 0) + (fixResult?.cost || 0) + reviewCost + reworkCost;
+        if (budgetUsd && spent >= budgetUsd) {
+          console.warn(`[BUDGET] #${issue.number} spent $${spent.toFixed(2)} ≥ its $${budgetUsd.toFixed(2)} cap — stopping the loop and handing to human review.`);
+          handoffReason = `the per-issue budget ($${budgetUsd.toFixed(2)}) was exhausted before the fix could be confirmed`;
+          overBudget = true;
+          blockingAtCap = true;
+          break;
+        }
+
         const validation = await validateBranch(worktree.dir);
 
         if (validation.unvalidated) {
@@ -466,7 +484,7 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
       }
     }
 
-    const status = resolveStatus({ merged, needsHumanReview: blockingAtCap, ciFailed, prExists });
+    const status = resolveStatus({ merged, needsHumanReview: blockingAtCap, overBudget, ciFailed, prExists });
     if (status === 'no-pr') {
       console.warn(`[PR] No pull request found for ${worktree.branch}. Fix is committed/pushed but no PR was opened — flagging as no-pr.`);
     }
@@ -525,12 +543,16 @@ export function checkBudgetConfig({ costCeiling, perIssueBudget, concurrency }) 
   return { level: 'ok', message: '', effectiveConcurrency: concurrency };
 }
 
-export async function runQueue(issues, repoPath, concurrency, costCeiling, dryRun) {
+export async function runQueue(issues, repoPath, concurrency, costCeiling, dryRun, { priorCost = 0 } = {}) {
   const queue = [...issues];
   const results = [];
   let stopped = false;
 
   startRun();
+  // Seed the run cost with spend that happened before the queue (discovery), so
+  // the ceiling and per-issue reservations account for it (C1). startRun() reset
+  // the in-memory total, so this must come after it.
+  if (priorCost > 0) recordRunCost(priorCost);
 
   // Per-issue budget reservation prevents concurrent issues from each seeing
   // spend below the ceiling and collectively overspending. The reserved amount

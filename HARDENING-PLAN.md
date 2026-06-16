@@ -42,12 +42,17 @@ Targets the five gaps from `CRITIQUE1.md`'s successor review plus hygiene items.
   `WORKTREE_ENV_FILES`; copied files are appended to the worktree's git exclude
   so `git add -A` can't sweep them into the PR diff.
 
-## PR C — Cost integrity
+## PR C — Cost integrity (done)
 
-- **C1. Count discovery spend against the ceiling** — `src/discovery.js`,
-  `src/index.js`, `src/logger.js`.
-- **C2. Real per-issue spend cap on the hand-rolled path** — `src/dispatcher.js`.
-  Accumulate cost and break the loop at `budgetUsd` (`over-budget`).
+- **C1. Count discovery spend against the ceiling** (done) — `recordRunCost()`
+  seeds the run total with the discovery phase's cost (passed into `runQueue`
+  as `priorCost`, after `startRun()`), so reservations and the ceiling include
+  it. Warns if discovery alone hits the ceiling.
+- **C2. Real per-issue spend cap on the hand-rolled path** (done) —
+  `src/dispatcher.js`. The loop sums triage+fix+review+rework spend and, once it
+  reaches `budgetUsd`, stops before starting more agent work and hands the fix
+  to a human as a distinct `over-budget` status. (The workflow path already has
+  `--max-budget-usd`.)
 
 ## PR D — Hygiene
 

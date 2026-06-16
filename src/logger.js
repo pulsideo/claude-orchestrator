@@ -50,6 +50,16 @@ export function releaseBudget(amount) {
   reservedCost = Math.max(0, reservedCost - amount);
 }
 
+/**
+ * Add already-spent cost that didn't go through logResult — e.g. the discovery
+ * phase, which runs before the issue queue — to the run total so the cost
+ * ceiling accounts for it (C1). Returns the new run cost.
+ */
+export function recordRunCost(amount) {
+  runCost += amount || 0;
+  return runCost;
+}
+
 /** Spent + reserved — what the ceiling is actually checked against under concurrency. */
 export function getCommittedCost() {
   return runCost + reservedCost;
