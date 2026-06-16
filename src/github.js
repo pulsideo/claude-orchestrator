@@ -94,21 +94,48 @@ export function getSeverity(issue) {
   return 'medium';
 }
 
-const CODE_FILE_RE = /\.(ts|tsx|js|jsx|cjs|mjs)$/;
-const TEST_FILE_RE = /(\.(test|spec)\.(ts|tsx|js|jsx|cjs|mjs)$|(^|\/)(__tests__|tests?)\/)/;
+const DEFAULT_CODE_EXTENSIONS = ['ts', 'tsx', 'js', 'jsx', 'cjs', 'mjs'];
 
-/** True if a path looks like a test file (by suffix or test directory). */
-export function isTestFile(path) {
-  return TEST_FILE_RE.test(path);
+/**
+ * Which file extensions count as code (#6). Defaults to JS/TS — the stack the
+ * test/lint gates natively understand — but a repo in another language can widen
+ * this (e.g. CODE_FILE_EXTENSIONS="py" or "go,rs") so its fix isn't mislabeled
+ * 'no-code-change'. Pair with TEST_COMMAND/LINT_COMMAND for the gates themselves.
+ */
+export function codeExtensions(env = process.env) {
+  const raw = (env.CODE_FILE_EXTENSIONS || '').trim();
+  if (!raw) return DEFAULT_CODE_EXTENSIONS;
+  return raw.split(/[\s,]+/).map(e => e.replace(/^\./, '')).filter(Boolean);
+}
+
+/** Regex-escaped alternation of the configured code extensions. */
+function extAlternation(env) {
+  return codeExtensions(env).map(e => e.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+}
+
+/** True if a path has a configured code extension. */
+function isCodeFile(path, env = process.env) {
+  return new RegExp(`\\.(${extAlternation(env)})$`).test(path);
+}
+
+/**
+ * True if a path looks like a test file: a test directory (__tests__/, test/,
+ * tests/), or a recognized naming convention on a configured code extension —
+ * `.test.`/`.spec.` (JS/TS), `_test.` (Go), or a `test_` prefix (Python).
+ */
+export function isTestFile(path, env = process.env) {
+  if (/(^|\/)(__tests__|tests?)\//.test(path)) return true;
+  const exts = extAlternation(env);
+  return new RegExp(`(\\.(test|spec)\\.(${exts})$)|(_test\\.(${exts})$)|((^|/)test_[^/]*\\.(${exts})$)`).test(path);
 }
 
 /** Split changed paths into production code vs test files. */
-export function classifyChangedFiles(files) {
+export function classifyChangedFiles(files, env = process.env) {
   const code = [];
   const tests = [];
   for (const f of files) {
-    if (!CODE_FILE_RE.test(f)) continue;
-    (isTestFile(f) ? tests : code).push(f);
+    if (!isCodeFile(f, env)) continue;
+    (isTestFile(f, env) ? tests : code).push(f);
   }
   return { code, tests };
 }
@@ -324,7 +351,7 @@ export async function validateBranch(worktreeDir, env = process.env) {
       return { passed: false, stage: 'no-changes', error: 'The fix produced no changes.' };
     }
 
-    const { code, tests } = classifyChangedFiles(changed);
+    const { code, tests } = classifyChangedFiles(changed, env);
 
     // No production code changed (test-only, config-only, or docs-only). The
     // code/test gate can't validate such a change, and a "fix" that touches no
