@@ -30,9 +30,12 @@ async function main() {
     await runMenu(process.env);
   }
 
-  // Read effective settings AFTER the menu may have changed them.
-  const concurrency = parseInt(process.env.MAX_CONCURRENCY || '3', 10);
-  const costCeiling = parseFloat(process.env.COST_CEILING_USD || '50');
+  // Read effective settings AFTER the menu may have changed them. The `|| N`
+  // fallbacks mirror configFromEnv (the menu path): a non-numeric headless value
+  // like MAX_CONCURRENCY=abc parses to NaN, which would otherwise flow through to
+  // zero queue workers and a run that "completes" without processing any issue.
+  const concurrency = parseInt(process.env.MAX_CONCURRENCY || '3', 10) || 3;
+  const costCeiling = parseFloat(process.env.COST_CEILING_USD || '50') || 50;
 
   console.log(`\nRepo: ${GITHUB_OWNER}/${GITHUB_REPO}`);
   console.log(`Providers: default=${process.env.DEFAULT_PROVIDER || 'claude'}, fix=${process.env.FIX_PROVIDER || process.env.DEFAULT_PROVIDER || 'claude'}, review=${process.env.REVIEW_PROVIDER || process.env.DEFAULT_PROVIDER || 'claude'}`);

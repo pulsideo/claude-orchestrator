@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { resolveStatus, statusForStage, loopDecision, checkBudgetConfig, resolvePerIssueBudget, noCodeChangeAction, autoMergeEnabled } from '../src/dispatcher.js';
+import { resolveStatus, statusForStage, loopDecision, checkBudgetConfig, resolvePerIssueBudget, noCodeChangeAction, autoMergeEnabled, resolveConcurrency } from '../src/dispatcher.js';
 import { parseReviewVerdict } from '../src/agent.js';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -96,6 +96,17 @@ test('loopDecision: passing gates + no blocking findings = confirmed', () => {
 test('loopDecision: blocking findings rework while iterations remain, else unconfirmed', () => {
   assert.equal(loopDecision({ validationPassed: true, blocking: true, iteration: 2, maxIterations: 3 }), 'rework-review');
   assert.equal(loopDecision({ validationPassed: true, blocking: true, iteration: 3, maxIterations: 3 }), 'unconfirmed-blocking');
+});
+
+// An invalid MAX_CONCURRENCY (e.g. "abc" → NaN) must not spawn zero workers and
+// silently process nothing — it clamps to a serial run.
+test('resolveConcurrency clamps to [1, queueLength] and survives NaN/garbage', () => {
+  assert.equal(resolveConcurrency(3, 10), 3);
+  assert.equal(resolveConcurrency(5, 2), 2);   // clamped to queue length
+  assert.equal(resolveConcurrency(NaN, 10), 1); // MAX_CONCURRENCY=abc → NaN → serial
+  assert.equal(resolveConcurrency(0, 10), 1);
+  assert.equal(resolveConcurrency(-4, 10), 1);
+  assert.equal(resolveConcurrency(2.5, 10), 1); // non-integer falls back to 1
 });
 
 // --- budget config sanity check -------------------------------------------

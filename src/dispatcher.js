@@ -585,6 +585,18 @@ export function checkBudgetConfig({ costCeiling, perIssueBudget, concurrency }) 
   return { level: 'ok', message: '', effectiveConcurrency: concurrency };
 }
 
+/**
+ * Worker count for the queue: the requested concurrency clamped to the queue
+ * length, never below 1. A non-positive or non-finite request (e.g. an invalid
+ * MAX_CONCURRENCY parsing to NaN) falls back to 1 so the run processes issues
+ * serially instead of silently spawning zero workers and reporting a clean run.
+ * Pure.
+ */
+export function resolveConcurrency(requested, queueLength) {
+  const req = Number.isInteger(requested) && requested > 0 ? requested : 1;
+  return Math.max(1, Math.min(req, queueLength));
+}
+
 export async function runQueue(issues, repoPath, concurrency, costCeiling, dryRun, { priorCost = 0 } = {}) {
   const queue = [...issues];
   const results = [];
@@ -601,7 +613,7 @@ export async function runQueue(issues, repoPath, concurrency, costCeiling, dryRu
   // becomes the workflow path's hard --max-budget-usd cap; for the hand-rolled
   // path it bounds how many issues run at once. Default slices the ceiling
   // across the worker pool; override with PER_ISSUE_BUDGET_USD.
-  const effConcurrency = Math.max(1, Math.min(concurrency, queue.length));
+  const effConcurrency = resolveConcurrency(concurrency, queue.length);
   const perIssueBudget = resolvePerIssueBudget(costCeiling, effConcurrency);
 
   async function next() {
