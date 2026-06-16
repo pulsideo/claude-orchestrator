@@ -1,4 +1,10 @@
 node_modules/
 .env
+.env.old
 run-log.json
 *:Zone.Identifier
+
+# Local agent/skill tooling (not part of the orchestrator)
+.agents/
+.claude/skills/
+skills-lock.json
