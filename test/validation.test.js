@@ -31,6 +31,33 @@ test('classifyChangedFiles splits code vs tests and ignores non-code', () => {
   assert.deepEqual(tests, ['src/app.test.ts']);
 });
 
+// #6: other languages can opt in via CODE_FILE_EXTENSIONS so their fixes aren't
+// mislabeled 'no-code-change', with test-naming conventions recognized too.
+test('classifyChangedFiles honors CODE_FILE_EXTENSIONS (Python)', () => {
+  const { code, tests } = classifyChangedFiles(
+    ['app.py', 'test_app.py', 'pkg/foo.py', 'main.go', 'README.md'],
+    { CODE_FILE_EXTENSIONS: 'py' },
+  );
+  assert.deepEqual(code, ['app.py', 'pkg/foo.py']);
+  assert.deepEqual(tests, ['test_app.py']); // test_ prefix; .go/.md ignored (not py)
+});
+
+test('classifyChangedFiles honors CODE_FILE_EXTENSIONS (Go, _test suffix)', () => {
+  const { code, tests } = classifyChangedFiles(
+    ['main.go', 'main_test.go', 'app.js'],
+    { CODE_FILE_EXTENSIONS: 'go' },
+  );
+  assert.deepEqual(code, ['main.go']);
+  assert.deepEqual(tests, ['main_test.go']); // app.js ignored (not go)
+});
+
+test('isTestFile recognizes per-language conventions under a configured ext', () => {
+  const env = { CODE_FILE_EXTENSIONS: 'py' };
+  assert.ok(isTestFile('test_foo.py', env));
+  assert.ok(isTestFile('pkg/tests/foo.py', env)); // test directory
+  assert.ok(!isTestFile('foo.py', env));
+});
+
 test('requireTests defaults on, disabled only by explicit false', () => {
   assert.equal(requireTests({}), true);
   assert.equal(requireTests({ REQUIRE_TESTS: 'true' }), true);

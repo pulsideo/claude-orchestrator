@@ -72,8 +72,27 @@ cp .env.example .env
 | `TEST_COMMAND` | Optional. Override the test-gate command; otherwise vitest/jest get scoped related-tests, else the repo's `test` script runs. If no runner can be determined the gate fails closed (the fix is handed to a human, never silently passed) |
 | `NO_CODE_CHANGE_ACTION` | What to do when a fix changes no production code: `human-review` (default — hand off immediately) or `rework` (nudge the agent to make a real change first, then hand off if it still doesn't) |
 | `LINT_COMMAND` | Optional. Override the lint command; otherwise the target repo's `lint` script is used if present |
+| `CODE_FILE_EXTENSIONS` | Optional. Comma/space-separated extensions counted as code when classifying a fix's changes (default: `ts,tsx,js,jsx,cjs,mjs`). Widen for non-JS/TS repos, e.g. `py` or `go,rs`, so a real fix isn't mislabeled `no-code-change` |
 | `WAIT_FOR_CI` | Wait for the PR's GitHub CI checks to go green before merging (default: `false`) |
 | `CI_TIMEOUT_MS` / `CI_POLL_INTERVAL_MS` | Tune CI polling (defaults: `600000` / `15000`) |
+
+#### Language support
+
+The orchestrator is **JavaScript/TypeScript-first**: the worktree install, the
+runner-aware test gate (vitest/jest related-tests, else the repo's `test`
+script), and the lint gate assume a Node toolchain. Other stacks (Python, Go,
+Rust, …) are supported on a best-effort basis by configuring the gates rather
+than through built-in language adapters:
+
+- `CODE_FILE_EXTENSIONS` — so the fix's changes are recognized as code (not
+  `no-code-change`) and its tests are classified correctly.
+- `TEST_COMMAND` — the command the test gate runs (it can't auto-detect a
+  non-Node runner; without it the gate fails closed to human review).
+- `LINT_COMMAND` — the lint command, if you want a lint gate.
+- `PACKAGE_MANAGER` — only relevant for Node repos.
+
+With those set, a fix in another language flows through validation and review;
+without them, such a fix is handed to a human rather than silently passed.
 
 ### Issue Labels
 
