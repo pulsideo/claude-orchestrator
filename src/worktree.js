@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import { existsSync, rmSync, copyFileSync, mkdirSync, readFileSync, appendFileSync } from 'fs';
 import { join, isAbsolute } from 'path';
 
@@ -88,6 +88,34 @@ function excludeFromGit(dir, paths) {
     // No git dir / unwritable exclude — fall back to the not-copying-secrets
     // protection above. Best effort.
   }
+}
+
+/**
+ * Stage and commit everything in the worktree; returns whether a commit was made
+ * (false = nothing to commit). The orchestrator owns the commit (extending ADR
+ * 0003): the fix/rework agents are told to commit, but if one forgets, its edits
+ * sit uncommitted — and validation read the dirty working tree while review, the
+ * PR diff, and the merge see only committed work, so an uncommitted "fix" could
+ * pass the gate yet never reach the PR and be discarded at cleanup (finding #2).
+ * Committing here keeps all four in sync. `git add -A` honors info/exclude, so a
+ * B2-copied secret can't be swept in. A fixed bot identity is supplied via -c so
+ * the commit never fails on a repo with no configured git user.
+ */
+export function commitAll(worktreeDir, message) {
+  execSync('git add -A', { cwd: worktreeDir, stdio: 'pipe' });
+  // `git diff --cached --quiet` exits non-zero iff something is staged.
+  try {
+    execSync('git diff --cached --quiet', { cwd: worktreeDir, stdio: 'pipe' });
+    return false; // nothing staged → agent already committed, or no edits
+  } catch {
+    // staged changes exist — commit them below
+  }
+  execFileSync('git', [
+    '-c', 'user.name=Claude Orchestrator',
+    '-c', 'user.email=orchestrator@users.noreply.github.com',
+    'commit', '-q', '-m', message,
+  ], { cwd: worktreeDir, stdio: 'pipe' });
+  return true;
 }
 
 /** The dev-dependency add command for a given package manager. */

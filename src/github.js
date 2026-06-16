@@ -160,10 +160,16 @@ export function detectLintCommand(worktreeDir, env = process.env) {
 }
 
 function collectChangedFiles(worktreeDir, env = process.env) {
+  // Committed + staged only — exactly what review (getDiff), the PR, and the
+  // merge see. The bare working-tree `git diff` is deliberately excluded: an
+  // uncommitted edit must NOT count toward validation, or a fix could pass the
+  // gate on changes that are never pushed and get discarded (finding #2). The
+  // orchestrator commits after each agent step (commitAll), so a real fix is
+  // committed by the time we get here; a purely-uncommitted tree reads as
+  // no-changes and fails closed to human review.
   const ranges = [
     `git diff --name-only origin/${baseBranch(env)}...HEAD`,
     'git diff --name-only --cached',
-    'git diff --name-only',
   ];
   const out = ranges
     .map(cmd => execSync(cmd, { cwd: worktreeDir, encoding: 'utf-8' }).trim())
