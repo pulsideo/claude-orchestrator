@@ -4,7 +4,8 @@ import { execSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createWorktree, removeWorktree, resolveBaseBranch } from '../src/worktree.js';
+import { createWorktree, removeWorktree, resolveBaseBranch, commitAll } from '../src/worktree.js';
+import { validateBranch } from '../src/github.js';
 
 // A real (offline) git repo with an `origin/main` so we exercise the actual
 // branch/worktree lifecycle the orchestrator uses — no mocks.
@@ -64,6 +65,41 @@ test('removeWorktree deletes the local fix branch', () => {
   // After cleanup the branch must be gone, not just the worktree.
   assert.equal(git(`branch --list ${branch}`, repo), '',
     'branch should be deleted after removeWorktree');
+});
+
+// #2: the orchestrator commits whatever the agent left behind, so the agent's
+// edits aren't stranded uncommitted (validated-but-never-pushed).
+test('commitAll commits uncommitted edits, and is a no-op when clean', () => {
+  const { dir, branch } = createWorktree(repo, 4244);
+  try {
+    writeFileSync(join(dir, 'src-fix.js'), 'export const x = 1;\n');
+    assert.equal(commitAll(dir, 'fix: stuff'), true, 'should commit the new file');
+    assert.equal(git('status --porcelain', dir), '', 'worktree should be clean after commit');
+    assert.equal(git('log -1 --format=%s', dir), 'fix: stuff');
+    // Nothing left to commit → no-op.
+    assert.equal(commitAll(dir, 'fix: again'), false, 'second call commits nothing');
+  } finally {
+    removeWorktree(repo, dir, branch);
+  }
+});
+
+// #2: validation must read committed state, not the dirty working tree — an
+// uncommitted-only edit could otherwise pass the gate yet never reach the PR.
+test('validateBranch ignores uncommitted edits (reads committed state)', async () => {
+  const { dir, branch } = createWorktree(repo, 4245);
+  try {
+    // Uncommitted code edit → must NOT count as a change.
+    writeFileSync(join(dir, 'feature.js'), 'export const f = () => 1;\n');
+    const dirty = await validateBranch(dir);
+    assert.equal(dirty.stage, 'no-changes', 'uncommitted edits must not count toward validation');
+
+    // Once committed, the same change is seen (and now gated on tests, etc.).
+    commitAll(dir, 'fix: add feature');
+    const committed = await validateBranch(dir);
+    assert.notEqual(committed.stage, 'no-changes', 'a committed change is validated');
+  } finally {
+    removeWorktree(repo, dir, branch);
+  }
 });
 
 // B2: only the test env file is copied (no production secrets), and a copied

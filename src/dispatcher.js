@@ -1,6 +1,6 @@
 import { execSync } from 'child_process';
 import { validateBranch, getSeverity, getPrForBranch, createPr, mergePr, flagForHumanReview, deleteRemoteBranch, waitForChecks } from './github.js';
-import { createWorktree, removeWorktree, baseBranch } from './worktree.js';
+import { createWorktree, removeWorktree, baseBranch, commitAll } from './worktree.js';
 import { runTriageAgent, runFixAgent, runReworkAgent, runReviewAgent } from './agent.js';
 import { resolveRole } from './providers.js';
 import { runFixWorkflow } from './workflow.js';
@@ -128,6 +128,29 @@ function pushBranch(worktree) {
   } catch (err) {
     console.warn(`[PUSH] ${worktree.branch}: ${err.message}`);
   }
+}
+
+/**
+ * Commit whatever the agent produced before we push/validate (finding #2). The
+ * agent is told to commit, but if it forgot, its edits would otherwise be
+ * validated from the dirty tree yet never pushed. Best-effort: a commit failure
+ * is logged, and an uncommitted tree then reads as no-changes downstream — which
+ * fails closed to human review, never a false success.
+ */
+function commitWork(worktree, message) {
+  try {
+    if (commitAll(worktree.dir, message)) {
+      console.log(`[COMMIT] ${worktree.branch}: committed the agent's changes.`);
+    }
+  } catch (err) {
+    console.warn(`[COMMIT] ${worktree.branch}: could not commit: ${err.message}`);
+  }
+}
+
+/** Commit any rework the agent produced, then push it (finding #2). */
+function commitAndPushRework(worktree, issue) {
+  commitWork(worktree, `fix: rework issue #${issue.number} - ${issue.title}`);
+  pushBranch(worktree);
 }
 
 /** Whether the workflow brain should run for this severity (Claude fix provider + opted in). */
@@ -272,6 +295,7 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
         return { issue: issue.number, status: 'fix-failed', totalCost };
       }
 
+      commitWork(worktree, `fix: resolve issue #${issue.number} - ${issue.title}`);
       await pushAndCreatePr(worktree, issue);
 
       // Authoritative gate — never trust the workflow's self-report.
@@ -323,7 +347,8 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
         return { issue: issue.number, status: 'fix-failed', totalCost };
       }
 
-      // Phase 3.5: orchestrator owns PR creation (ADR 0003).
+      // Phase 3.5: orchestrator owns the commit + PR creation (ADR 0003).
+      commitWork(worktree, `fix: resolve issue #${issue.number} - ${issue.title}`);
       await pushAndCreatePr(worktree, issue);
 
       // Phases 4–5: iterative fix → validate → review loop (ADR 0002).
@@ -370,7 +395,7 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
             const r = await runReworkAgent(issue, 'You changed no production code — did you actually fix the issue? Implement the real code change that resolves it, and add or update a test that covers it.', worktree.dir);
             reworkCost += r.cost;
             reworkDuration += r.duration;
-            pushBranch(worktree);
+            commitAndPushRework(worktree, issue);
           } catch (err) {
             console.warn(`[REWORK] failed: ${err.error || err.message}`);
             blockingAtCap = true;
@@ -388,7 +413,7 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
             const r = await runReworkAgent(issue, `The fix did not pass the '${validation.stage}' gate:\n${validation.error}\n\nResolve this so the gate passes; keep the change minimal.`, worktree.dir);
             reworkCost += r.cost;
             reworkDuration += r.duration;
-            pushBranch(worktree);
+            commitAndPushRework(worktree, issue);
           } catch (err) {
             console.warn(`[REWORK] failed: ${err.error || err.message}`);
             failStage = validation.stage;
@@ -415,7 +440,7 @@ export async function processIssue(issue, repoPath, dryRun = false, { budgetUsd 
           const r = await runReworkAgent(issue, formatReviewComments(review.comments), worktree.dir);
           reworkCost += r.cost;
           reworkDuration += r.duration;
-          pushBranch(worktree);
+          commitAndPushRework(worktree, issue);
         } catch (err) {
           console.warn(`[REWORK] failed: ${err.error || err.message}`);
           blockingAtCap = true;
