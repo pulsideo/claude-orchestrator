@@ -1,7 +1,8 @@
 import { execFile } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { getSeverity } from './github.js';
+import { getSeverity, displayTestCommand } from './github.js';
+import { baseBranch } from './worktree.js';
 import { loadPrompt } from './agent.js';
 import {
   claudeModelForRole, resolveBin, REGISTRY,
@@ -51,10 +52,16 @@ export function buildWorkflowArgs(issue, worktree, severity, env = process.env) 
   const fixTemplate = (severity === 'critical' || severity === 'high') ? 'fix-critical' : 'fix-standard';
   const branchName = worktree.branch;
   const tokenBudget = parseInt(env.PER_ISSUE_TOKEN_BUDGET || '0', 10) || null;
+  // Same runner-aware command the hand-rolled path injects, so the workflow's
+  // agents are told the repo's real test command, not a literal {{testCommand}} (#2).
+  const testCommand = displayTestCommand(worktree.dir, env);
 
   return {
     issueNumber: issue.number,
     branch: branchName,
+    // The base branch the workflow's review-diff is taken against (#1); falls
+    // back to 'main' inside the script if absent.
+    baseBranch: baseBranch(env),
     severity,
     maxIterations: Math.max(1, parseInt(env.MAX_ITERATIONS || '3', 10) || 3),
     tokenBudget,
@@ -66,9 +73,9 @@ export function buildWorkflowArgs(issue, worktree, severity, env = process.env) 
       review: claudeModelForRole('review', severity, env),
     },
     triagePrompt: loadPrompt('triage', ctx),
-    fixPrompt: loadPrompt(fixTemplate, { ...ctx, branchName }),
+    fixPrompt: loadPrompt(fixTemplate, { ...ctx, branchName, testCommand }),
     reviewPrompt: loadPrompt('review', ctx),
-    reworkPrompt: loadPrompt('rework', { ...ctx, branchName }),
+    reworkPrompt: loadPrompt('rework', { ...ctx, branchName, testCommand }),
   };
 }
 

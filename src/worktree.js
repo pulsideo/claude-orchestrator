@@ -25,13 +25,37 @@ export function detectPackageManager(dir, env = process.env) {
   return 'npm';
 }
 
+// Git permits ref characters that are unsafe to interpolate into a shell command
+// (`;`, `$`, spaces, backticks, …). The base branch IS interpolated into git
+// commands across the orchestrator (worktree add, diff, checkout, fetch, rebase)
+// and into the workflow's review-diff prompt, so constrain it to a conservative
+// subset of valid ref characters: must start alphanumeric, then letters/digits/
+// `._/-`, and no `..` (which git disallows in refs anyway). (#3)
+const SAFE_BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+
+export function isSafeBranchName(name) {
+  return typeof name === 'string' && SAFE_BRANCH_RE.test(name) && !name.includes('..');
+}
+
+function assertSafeBranch(name, source) {
+  if (!isSafeBranchName(name)) {
+    throw new Error(
+      `Unsafe base branch name from ${source}: ${JSON.stringify(name)}. ` +
+      `Allowed: letters, digits, '.', '_', '/', '-' (not starting with '-' or containing '..').`,
+    );
+  }
+  return name;
+}
+
 /**
  * The repo's default/base branch — the branch fixes are cut from, validated
  * against, and merged into (#5). Reads the value index.js resolved once via
- * resolveBaseBranch; falls back to 'main' so nothing hardcodes it. Pure.
+ * resolveBaseBranch; falls back to 'main' so nothing hardcodes it. Validated
+ * (#3) so an out-of-band BASE_BRANCH can't inject shell syntax at an
+ * interpolation site. Pure.
  */
 export function baseBranch(env = process.env) {
-  return env.BASE_BRANCH || 'main';
+  return assertSafeBranch(env.BASE_BRANCH || 'main', 'BASE_BRANCH');
 }
 
 /**
@@ -39,10 +63,12 @@ export function baseBranch(env = process.env) {
  * else the remote's published default (origin/HEAD) — set by `git clone` or
  * `git remote set-head origin -a`; else 'main'. index.js stores the result in
  * BASE_BRANCH so every later baseBranch() call is a cheap env read, and a repo
- * on master/trunk/etc. is no longer assumed to use 'main'.
+ * on master/trunk/etc. is no longer assumed to use 'main'. An explicit but
+ * unsafe BASE_BRANCH throws (fail fast at startup); an unsafe *detected* name is
+ * ignored in favor of 'main' since detection is best-effort (#3).
  */
 export function resolveBaseBranch(repoPath, env = process.env) {
-  if (env.BASE_BRANCH) return env.BASE_BRANCH;
+  if (env.BASE_BRANCH) return assertSafeBranch(env.BASE_BRANCH, 'BASE_BRANCH');
   try {
     const ref = execSync('git symbolic-ref --short refs/remotes/origin/HEAD', {
       cwd: repoPath,
@@ -50,7 +76,8 @@ export function resolveBaseBranch(repoPath, env = process.env) {
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     const name = ref.replace(/^origin\//, '');
-    if (name) return name;
+    if (name && isSafeBranchName(name)) return name;
+    if (name) console.warn(`[INIT] Ignoring unsafe detected default branch ${JSON.stringify(name)}; using 'main'.`);
   } catch {
     // origin/HEAD not set (some clones don't record it) — fall back to 'main'.
   }

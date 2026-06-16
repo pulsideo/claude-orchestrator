@@ -13,6 +13,7 @@ export const meta = {
 const a = typeof args === 'string' ? JSON.parse(args) : (args || {})
 const {
   issueNumber,
+  baseBranch = 'main',
   maxIterations = 3,
   tokenBudget = null,
   models = {},
@@ -66,7 +67,7 @@ for (let i = 1; i <= maxIterations; i++) {
 
   // Capture the current branch diff for review (sub-agent runs git in the worktree).
   const diff = await agent(
-    'Run `git --no-pager diff origin/main...HEAD` and output ONLY the raw diff, no commentary.',
+    `Run \`git --no-pager diff origin/${baseBranch}...HEAD\` and output ONLY the raw diff, no commentary.`,
     { label: `diff:#${issueNumber}`, phase: 'Verify', model: models.review },
   )
   const reviewBase = reviewPrompt.replaceAll('{{diff}}', String(diff).slice(0, 60000))
@@ -100,7 +101,7 @@ for (let i = 1; i <= maxIterations; i++) {
 
 // Advisory file list for the harness summary.
 const filesRaw = await agent(
-  'Run `git --no-pager diff --name-only origin/main...HEAD` and output ONLY the file list.',
+  `Run \`git --no-pager diff --name-only origin/${baseBranch}...HEAD\` and output ONLY the file list.`,
   { label: `files:#${issueNumber}`, phase: 'Verify', model: models.review },
 ).catch(() => '')
 
