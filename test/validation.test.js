@@ -9,6 +9,7 @@ import {
   requireTests,
   detectLintCommand,
   detectTestRunner,
+  displayTestCommand,
   summarizeChecks,
 } from '../src/github.js';
 
@@ -78,6 +79,32 @@ test('detectTestRunner: vitest/jest get JSON related-tests, script falls back, n
     // a package.json with neither a known runner nor a test script → null
     writeFileSync(join(d, 'package.json'), JSON.stringify({ scripts: { build: 'tsc' } }));
     assert.equal(detectTestRunner(d, {}), null);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
+// #7: the agent prompts get the detected test command, not a hardcoded
+// `npx vitest run`, so jest/script repos aren't told to run the wrong tool.
+test('displayTestCommand mirrors the detected runner', () => {
+  const d = mkdtempSync(join(tmpdir(), 'orch-cmd-'));
+  try {
+    // TEST_COMMAND override wins, even with no package.json
+    assert.equal(displayTestCommand(d, { TEST_COMMAND: 'make test' }), 'make test');
+
+    // no package.json → fall back to the package manager's test script
+    assert.equal(displayTestCommand(d, {}), 'npm test');
+
+    writeFileSync(join(d, 'package.json'), JSON.stringify({ devDependencies: { vitest: '^1' } }));
+    assert.equal(displayTestCommand(d, {}), 'npx vitest run');
+
+    writeFileSync(join(d, 'package.json'), JSON.stringify({ dependencies: { jest: '^29' } }));
+    assert.equal(displayTestCommand(d, {}), 'npx jest');
+
+    // script-only repo → `<pm> test`, here pnpm via the lockfile
+    writeFileSync(join(d, 'package.json'), JSON.stringify({ scripts: { test: 'mocha' } }));
+    writeFileSync(join(d, 'pnpm-lock.yaml'), '');
+    assert.equal(displayTestCommand(d, {}), 'pnpm test');
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
