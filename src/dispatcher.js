@@ -97,8 +97,10 @@ export function resolveStatus({ merged, needsHumanReview, overBudget, ciFailed, 
 async function acquireReview(issue, worktreeDir) {
   try {
     if (process.env.GREPTILE_API_KEY) {
-      const comments = await reviewWithGreptile(worktreeDir);
-      return { blocking: comments.length > 0, comments, cost: 0, ran: true };
+      // `blocking` comes from Greptile's verdict, not from whether it returned
+      // any prose — a "looks good" summary is still text (E2 / finding #4).
+      const { blocking, comments } = await reviewWithGreptile(worktreeDir);
+      return { blocking, comments, cost: 0, ran: true };
     }
     if (process.env.ENABLE_REVIEW === 'false') {
       return { blocking: false, comments: [], cost: 0, ran: true };

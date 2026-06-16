@@ -1,4 +1,5 @@
 import { execSync } from 'child_process';
+import { parseReviewVerdict } from './agent.js';
 
 const GREPTILE_API_BASE = 'https://api.greptile.com/v2';
 
@@ -11,7 +12,10 @@ const {
 
 /**
  * Review a diff against the indexed codebase using Greptile's query API.
- * Returns comments in the same shape the refinement agent expects.
+ * Returns `{ blocking, comments }` — `blocking` comes from an explicit verdict in
+ * the model's reply, NOT from whether it produced any prose (a "looks good"
+ * summary is still text). `comments` carry the prose/sources for the rework
+ * prompt. An empty diff is non-blocking with nothing to say.
  */
 export async function reviewWithGreptile(worktreeDir) {
   if (!GREPTILE_API_KEY) {
@@ -20,7 +24,7 @@ export async function reviewWithGreptile(worktreeDir) {
 
   const diff = getDiff(worktreeDir);
   if (!diff) {
-    return [];
+    return { blocking: false, comments: [] };
   }
 
   const response = await fetch(`${GREPTILE_API_BASE}/query`, {
@@ -42,6 +46,8 @@ export async function reviewWithGreptile(worktreeDir) {
 
 Be specific: reference file paths and line numbers when possible. Skip purely stylistic feedback.
 
+End your reply with a verdict line on its own: \`VERDICT: CHANGES_REQUESTED\` if there are blocking issues that must be fixed before merge, or \`VERDICT: PASS\` if the change is correct and complete.
+
 \`\`\`diff
 ${diff}
 \`\`\``,
@@ -59,7 +65,21 @@ ${diff}
   }
 
   const data = await response.json();
-  return formatGreptileResponse(data);
+  return interpretGreptileResponse(data);
+}
+
+/**
+ * Interpret a Greptile response into `{ blocking, comments }`. Pure, so the
+ * verdict logic is testable without a live API call. `blocking` is decided by
+ * the verdict in the reply (shared with the review agent via parseReviewVerdict),
+ * never by mere presence of text — otherwise any "looks good" summary would read
+ * as changes-requested and the loop could never confirm a clean fix.
+ */
+export function interpretGreptileResponse(data) {
+  return {
+    blocking: parseReviewVerdict(data?.message || ''),
+    comments: formatGreptileResponse(data),
+  };
 }
 
 export function getDiff(worktreeDir) {
