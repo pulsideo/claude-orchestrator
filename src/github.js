@@ -173,6 +173,23 @@ export function detectTestRunner(dir, env = process.env) {
   return null;
 }
 
+/**
+ * The human-runnable test command for a checkout, injected into the agent
+ * prompts so they don't hardcode `npx vitest run` in a jest/script repo (#7).
+ * Mirrors how the gate actually runs (detectTestRunner): TEST_COMMAND override,
+ * else vitest/jest, else the repo's `<pm> test`. Guidance only — the gate, not
+ * the prompt, is authoritative. Pure.
+ */
+export function displayTestCommand(dir, env = process.env) {
+  if (env.TEST_COMMAND) return env.TEST_COMMAND;
+  const runner = detectTestRunner(dir, env);
+  switch (runner?.kind) {
+    case 'vitest': return 'npx vitest run';
+    case 'jest': return 'npx jest';
+    default: return `${detectPackageManager(dir, env)} test`;
+  }
+}
+
 /** Build the test command for a detected runner. `parse` flags JSON output. */
 function planTests(runner, dir, codeFiles, env) {
   const quoted = codeFiles.map(f => `'${f.replace(/'/g, "'\\''")}'`).join(' ');

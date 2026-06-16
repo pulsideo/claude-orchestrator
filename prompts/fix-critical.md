@@ -17,7 +17,7 @@ Follow these steps in order:
 3. Run the test to confirm it fails for the right reason
 4. Implement the minimal fix needed
 5. Run the failing test again to confirm it now passes
-6. Run the full test suite (`npx vitest run`) to confirm nothing else broke
+6. Run the full test suite (`{{testCommand}}`) to confirm nothing else broke
 7. If any tests fail after your fix, investigate and fix those too
 8. Stage and commit all changes with message: "fix: resolve issue #{{issueNumber}} - {{issueTitle}}"
 9. Push the branch to origin: `git push origin {{branchName}}`

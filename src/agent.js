@@ -2,7 +2,7 @@ import { spawn } from 'child_process';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { getSeverity } from './github.js';
+import { getSeverity, displayTestCommand } from './github.js';
 import {
   resolveRole, resolveBin, estimateCost, loadPrices,
   buildSubprocessEnv, fallbackEnabled, isApiKeyDisabled, disableApiKeyForRun, isCreditExhausted,
@@ -169,6 +169,7 @@ export function runReworkAgent(issue, feedback, worktreeDir) {
     issueBody: issue.body || '(no description)',
     feedback,
     branchName: `fix/issue-${issue.number}`,
+    testCommand: displayTestCommand(worktreeDir),
   });
 
   return runAgent({
@@ -200,6 +201,7 @@ export function runFixAgent(issue, triageAnalysis, worktreeDir) {
     issueBody: issue.body || '(no description)',
     triageAnalysis: triageAnalysis || 'No triage analysis available.',
     branchName: `fix/issue-${issue.number}`,
+    testCommand: displayTestCommand(worktreeDir),
   });
 
   return runAgent({

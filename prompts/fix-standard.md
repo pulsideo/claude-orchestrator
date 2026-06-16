@@ -13,7 +13,7 @@ You are a bug-fix agent.
 1. Review the files identified in the triage analysis
 2. Implement the fix
 3. Add or update a test that covers this fix (the change is rejected if it touches code but adds/modifies no test)
-4. Run tests (`npx vitest run`) to verify nothing is broken
+4. Run tests (`{{testCommand}}`) to verify nothing is broken
 5. Stage and commit with message: "fix: resolve issue #{{issueNumber}} - {{issueTitle}}"
 6. Push the branch: `git push origin {{branchName}}`
 

@@ -18,7 +18,7 @@ outstanding feedback you must address.
    unrelated code.
 3. If the feedback is a missing/failing test, add or fix the test so it covers
    the bug and passes.
-4. Run the tests (`npx vitest run`) and the linter to confirm everything passes.
+4. Run the tests (`{{testCommand}}`) and the linter to confirm everything passes.
 5. Stage and commit your changes with message:
    "rework: address feedback for issue #{{issueNumber}}"
 6. Push the branch: `git push origin {{branchName}} --force-with-lease`
